@@ -99,6 +99,21 @@ export default function Recorder({
   // True if the processed picture never appears; then the raw camera is
   // shown and recorded instead, so you can still sing.
   const [rawCamera, setRawCamera] = useState(false);
+  // Framing: 1× fills the frame; zoom out to show more of you and the room.
+  // Remembered on this device.
+  const [zoom, setZoom] = useState(() => {
+    try {
+      return Number(localStorage.getItem("song-recorder:zoom")) || 1;
+    } catch {
+      return 1;
+    }
+  });
+  useEffect(() => {
+    fx.zoom = zoom;
+    try {
+      localStorage.setItem("song-recorder:zoom", String(zoom));
+    } catch {}
+  }, [fx, zoom]);
   const [sheet, setSheet] = useState<null | "bg" | "sound">(null);
   const [thumbs] = useState(() =>
     Object.fromEntries(
@@ -487,6 +502,24 @@ export default function Recorder({
               <span className="w-9 shrink-0" />
             )}
           </div>
+
+          {/* Zoom out: how much of you the frame shows */}
+          {phase.kind === "setup" && !rawCamera && (
+            <div className="absolute top-1/3 right-3 flex flex-col gap-1.5 rounded-full bg-black/40 p-1 backdrop-blur-md">
+              {[0.6, 0.8, 1].map((z) => (
+                <button
+                  key={z}
+                  aria-label={`Zoom ${z}x`}
+                  onClick={() => setZoom(z)}
+                  className={`h-9 w-9 rounded-full text-xs font-semibold transition ${
+                    zoom === z ? "bg-white text-black" : "text-white/80"
+                  }`}
+                >
+                  {z}×
+                </button>
+              ))}
+            </div>
+          )}
 
           {/* Background status, so it never fails silently */}
           {cameraOn &&

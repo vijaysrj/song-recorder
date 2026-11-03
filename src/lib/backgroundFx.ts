@@ -80,6 +80,9 @@ export class BackgroundFx {
   private failures = 0;
   private status: FxStatus = { kind: "plain" };
 
+  /** 1 fills the 9:16 frame with the camera; smaller shows more of the room. */
+  zoom = 1;
+
   /** Average time to process one frame / to segment one frame, in ms. */
   frameMs = 0;
   segMs = 0;
@@ -96,6 +99,7 @@ export class BackgroundFx {
   private person = canvas(OUT_W, OUT_H);
   private blurA = canvas();
   private blurB = canvas();
+  private fill = canvas(27, 48);
 
   setChoice(choice: BackgroundChoice, customUrl: string | null) {
     this.choice = choice;
@@ -200,13 +204,56 @@ export class BackgroundFx {
     const H = v.videoHeight;
     if (!W || !H || v.readyState < 2) return false;
 
-    // 1. Crop the camera to 9:16, centred.
-    const scale = Math.max(OUT_W / W, OUT_H / H);
-    const sw = OUT_W / scale;
-    const sh = OUT_H / scale;
+    // 1. Fit the camera into the 9:16 frame. At zoom 1 it fills the frame
+    //    (cropping the sides); below 1 you're shown smaller, with a soft
+    //    blurred copy of the camera filling any gap.
+    const cover = Math.max(OUT_W / W, OUT_H / H);
+    const scale = cover * this.zoom;
     const fg = ctx2d(this.frame);
+    fg.imageSmoothingEnabled = true;
     fg.imageSmoothingQuality = "high";
-    fg.drawImage(v, (W - sw) / 2, (H - sh) / 2, sw, sh, 0, 0, OUT_W, OUT_H);
+    const dw = W * scale;
+    const dh = H * scale;
+    if (dw < OUT_W || dh < OUT_H) {
+      const f = this.fill;
+      const fc = ctx2d(f);
+      const cw = OUT_W / cover;
+      const ch = OUT_H / cover;
+      fc.drawImage(
+        v,
+        (W - cw) / 2,
+        (H - ch) / 2,
+        cw,
+        ch,
+        0,
+        0,
+        f.width,
+        f.height,
+      );
+      fg.drawImage(f, 0, 0, OUT_W, OUT_H);
+      fg.fillStyle = "rgba(0,0,0,0.25)";
+      fg.fillRect(0, 0, OUT_W, OUT_H);
+    }
+    // Centred sideways; vertically a little above centre, where faces are.
+    const dx = (OUT_W - dw) / 2;
+    const dy = (OUT_H - dh) * 0.45;
+    if (dw < OUT_W || dh < OUT_H) {
+      // Smaller than the frame: a rounded, softly shadowed card, so it looks
+      // deliberate rather than letterboxed.
+      fg.save();
+      fg.shadowColor = "rgba(0,0,0,0.45)";
+      fg.shadowBlur = 40;
+      fg.beginPath();
+      fg.roundRect(dx, dy, dw, dh, 36);
+      fg.fillStyle = "#000";
+      fg.fill();
+      fg.shadowColor = "transparent";
+      fg.clip();
+      fg.drawImage(v, dx, dy, dw, dh);
+      fg.restore();
+    } else {
+      fg.drawImage(v, dx, dy, dw, dh);
+    }
 
     const og = ctx2d(out);
     const effectOn =
