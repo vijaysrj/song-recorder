@@ -12,6 +12,28 @@ type Phase =
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Phones don't always label audio files correctly (an MP3 from Downloads or
+// WhatsApp can come through with no type), so work it out from the name.
+const AUDIO_TYPES: Record<string, string> = {
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  wav: "audio/wav",
+  ogg: "audio/ogg",
+  opus: "audio/ogg",
+  flac: "audio/flac",
+  mp4: "video/mp4",
+};
+// Listing extensions as well as audio/* makes Android open the full file
+// browser (Downloads, WhatsApp, Drive) instead of just the music library.
+const ACCEPT = "audio/*,video/mp4," + Object.keys(AUDIO_TYPES).map((e) => "." + e).join(",");
+
+function contentTypeFor(file: File) {
+  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+  if (file.type.startsWith("audio/") || file.type === "video/mp4") return file.type;
+  return AUDIO_TYPES[ext] ?? "audio/mpeg";
+}
+
 export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
@@ -25,6 +47,7 @@ export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
       setPhase({ kind: "uploading", pct: 0 });
       const blob = await upload(`songs/${file.name}`, file, {
         access: "public",
+        contentType: contentTypeFor(file),
         handleUploadUrl: "/api/upload",
         onUploadProgress: (e) => setPhase({ kind: "uploading", pct: Math.round(e.percentage) }),
       });
@@ -75,7 +98,7 @@ export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
       <label className="block rounded-xl border-2 border-dashed border-white/20 p-5 text-center active:bg-white/5">
         <input
           type="file"
-          accept="audio/*"
+          accept={ACCEPT}
           className="hidden"
           disabled={busy}
           onChange={(e) => {
