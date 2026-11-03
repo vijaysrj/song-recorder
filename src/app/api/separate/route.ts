@@ -9,7 +9,7 @@ export async function POST(request: Request) {
     const version = await getDemucsVersion(replicate);
     const prediction = await replicate.predictions.create({
       version,
-      input: { audio: url, stem: "vocals", output_format: "mp3" },
+      input: { audio: url, isolate_stem: "vocals", format: "mp3" },
     });
     return Response.json({ id: prediction.id });
   } catch (error) {
