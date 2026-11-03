@@ -1,9 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { readSession, SESSION_COOKIE } from "@/lib/auth";
 
-// Everything except the sign-in page, the sign-in routes and static files
+// Everything except the landing page, the sign-in page, the sign-in routes and static files
 // needs a valid Google session for an allowed account.
 export async function proxy(request: NextRequest) {
+  // The landing page is public.
+  if (request.nextUrl.pathname === "/") return NextResponse.next();
+
   // Until the Google keys are added, Vercel's own login guards the app.
   if (!process.env.GOOGLE_CLIENT_ID) return NextResponse.next();
 

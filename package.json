@@ -3,12 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "predev": "node scripts/copy-mediapipe.mjs",
     "dev": "next dev",
+    "prebuild": "node scripts/copy-mediapipe.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.21",
     "@vercel/blob": "^2.8.2",
     "jose": "^6.2.15",
     "next": "16.4.3",

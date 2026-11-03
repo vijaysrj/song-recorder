@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { Suspense } from "react";
 import LoginError from "./LoginError";
 
@@ -21,6 +22,9 @@ export default function LoginPage() {
       <Suspense>
         <LoginError />
       </Suspense>
+      <Link href="/" className="text-sm text-white/50">
+        ← Back to home
+      </Link>
     </main>
   );
 }

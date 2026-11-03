@@ -51,7 +51,7 @@ export async function GET(request: NextRequest) {
   if (!issuerOk || claims.aud !== clientId || claims.email_verified !== true) return fail("google");
   if (!allowedEmails().includes(email)) return fail("denied");
 
-  const res = NextResponse.redirect(new URL("/", request.url));
+  const res = NextResponse.redirect(new URL("/studio", request.url));
   res.cookies.set(SESSION_COOKIE, await createSession(email), sessionCookieOptions);
   res.cookies.delete(STATE_COOKIE);
   return res;
