@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Song } from "@/lib/library";
 import TimedLyrics from "./TimedLyrics";
+import { buildVocalChain } from "@/lib/vocalChain";
 
 type Phase =
   | { kind: "setup" }
@@ -35,15 +36,20 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
   const musicGainRef = useRef<GainNode | null>(null);
   const voiceGainRef = useRef<GainNode | null>(null);
   const wakeRef = useRef<WakeLockSentinel | null>(null);
+  const setReverbRef = useRef<(v: number) => void>(() => {});
 
   const [phase, setPhase] = useState<Phase>({ kind: "setup" });
   const [voice, setVoice] = useState(1);
   const [music, setMusic] = useState(0.8);
   const [elapsed, setElapsed] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [studio, setStudio] = useState(true);
+  const [reverb, setReverb] = useState(0.3);
+  const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
+  const [micId, setMicId] = useState("");
 
   // Live preview of the front camera while setting up.
-  function startCamera(isCancelled: () => boolean = () => false) {
+  function startCamera(isCancelled: () => boolean = () => false, mic = micId) {
     const portrait = window.matchMedia("(orientation: portrait)").matches;
     navigator.mediaDevices
       .getUserMedia({
@@ -55,9 +61,18 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
           height: { ideal: portrait ? 1920 : 1080 },
           frameRate: { ideal: 30 },
         },
-        // Raw voice: with headphones there is no echo to cancel, and these
-        // filters make singing sound thin.
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        // Raw, full-band voice: with headphones there is no echo to cancel,
+        // and phone call filters make singing sound thin and pumpy. The
+        // studio chain does the polishing instead.
+        audio: {
+          ...(mic ? { deviceId: { exact: mic } } : {}),
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          sampleRate: { ideal: 48000 },
+          sampleSize: { ideal: 24 },
+          channelCount: { ideal: 1 },
+        },
       })
       .then((stream) => {
         if (isCancelled()) return stream.getTracks().forEach((t) => t.stop());
@@ -65,6 +80,10 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
         // Tell the encoder to keep sharpness rather than drop resolution.
         stream.getVideoTracks().forEach((t) => (t.contentHint = "detail"));
         if (videoRef.current) videoRef.current.srcObject = stream;
+        navigator.mediaDevices
+          .enumerateDevices()
+          .then((all) => setMics(all.filter((d) => d.kind === "audioinput" && d.deviceId)))
+          .catch(() => {});
       })
       .catch((e) =>
         setPhase({ kind: "error", message: `Camera or microphone blocked: ${(e as Error).message}` }),
@@ -93,6 +112,7 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
   useEffect(() => {
     if (voiceGainRef.current) voiceGainRef.current.gain.value = voice;
   }, [voice]);
+  useEffect(() => setReverbRef.current(reverb), [reverb]);
 
   function cleanup() {
     try {
@@ -122,16 +142,19 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       // Audio graph:
       //   music -> musicGain -> speakers/headphones (what you hear)
       //   music -> musicGain -> delay -> mix   (delayed to line up with your voice)
-      //   mic   -> voiceGain -> mix
+      //   mic   -> studio vocal chain -> voiceGain -> mix
       const mixOut = ctx.createMediaStreamDestination();
-      // Gentle limiter so loud notes (or voice turned up) don't distort.
+      // Limiter so loud notes (or voice turned up) never clip, with a little
+      // headroom left for the MP4 encoder.
       const mix = ctx.createDynamicsCompressor();
-      mix.threshold.value = -6;
-      mix.knee.value = 6;
-      mix.ratio.value = 12;
-      mix.attack.value = 0.003;
-      mix.release.value = 0.25;
-      mix.connect(mixOut);
+      mix.threshold.value = -8;
+      mix.knee.value = 4;
+      mix.ratio.value = 20;
+      mix.attack.value = 0.001;
+      mix.release.value = 0.2;
+      const ceiling = ctx.createGain();
+      ceiling.gain.value = 0.85;
+      mix.connect(ceiling).connect(mixOut);
       const musicGain = ctx.createGain();
       musicGain.gain.value = music;
       musicGainRef.current = musicGain;
@@ -153,14 +176,17 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       musicGain.connect(ctx.destination);
       musicGain.connect(delay).connect(mix);
 
-      ctx.createMediaStreamSource(cam).connect(voiceGain).connect(mix);
+      const chain = buildVocalChain(ctx, studio, reverb);
+      setReverbRef.current = chain.setReverb;
+      ctx.createMediaStreamSource(cam).connect(chain.input);
+      chain.output.connect(voiceGain).connect(mix);
 
       const stream = new MediaStream([...cam.getVideoTracks(), ...mixOut.stream.getAudioTracks()]);
       const mimeType = pickMimeType();
       const rec = new MediaRecorder(stream, {
         mimeType,
         videoBitsPerSecond: 8_000_000,
-        audioBitsPerSecond: 192_000,
+        audioBitsPerSecond: 320_000,
       });
       recRef.current = rec;
       const chunks: Blob[] = [];
@@ -221,6 +247,8 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
     setPhase({ kind: "setup" });
     startCamera();
   }
+
+  const cam0MicId = () => camRef.current?.getAudioTracks()[0]?.getSettings().deviceId ?? "";
 
   const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
   const live = phase.kind === "countdown" || phase.kind === "recording";
@@ -306,13 +334,47 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
           <>
             <Slider label="🎵 Music" value={music} onChange={setMusic} />
             <Slider label="🎤 Voice" value={voice} onChange={setVoice} max={2} />
+            {studio && <Slider label="✨ Reverb" value={reverb} onChange={setReverb} />}
           </>
         )}
 
         {phase.kind === "setup" && (
           <>
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>
+                🎙️ Studio voice
+                <span className="block text-xs text-white/50">EQ, compression and reverb, like a studio mix</span>
+              </span>
+              <input
+                type="checkbox"
+                checked={studio}
+                onChange={(e) => setStudio(e.target.checked)}
+                className="h-5 w-5 accent-pink-500"
+              />
+            </label>
+            {mics.length > 1 && (
+              <label className="flex items-center gap-3 text-sm">
+                <span className="w-20 shrink-0">🎤 Mic</span>
+                <select
+                  value={micId || cam0MicId()}
+                  onChange={(e) => {
+                    setMicId(e.target.value);
+                    stopCamera();
+                    startCamera(undefined, e.target.value);
+                  }}
+                  className="min-w-0 flex-1 rounded-lg bg-white/10 px-2 py-1.5"
+                >
+                  {mics.map((m, i) => (
+                    <option key={m.deviceId} value={m.deviceId} className="bg-neutral-900">
+                      {m.label || `Microphone ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <p className="text-center text-xs text-white/50">
-              🎧 Plug in headphones so the music stays out of the mic.
+              🎧 Use wired headphones so the music stays out of the mic. Bluetooth headphones switch the
+              phone to a low-quality call mic; if you use them, pick the phone&apos;s own mic above.
             </p>
             <button onClick={start} className="w-full rounded-xl bg-red-600 py-3.5 text-base font-semibold">
               ● Start recording
