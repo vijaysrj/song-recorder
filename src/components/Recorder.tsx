@@ -99,21 +99,8 @@ export default function Recorder({
   // True if the processed picture never appears; then the raw camera is
   // shown and recorded instead, so you can still sing.
   const [rawCamera, setRawCamera] = useState(false);
-  // Framing: 1× fills the frame; zoom out to show more of you and the room.
-  // Remembered on this device.
-  const [zoom, setZoom] = useState(() => {
-    try {
-      return Number(localStorage.getItem("song-recorder:zoom")) || 1;
-    } catch {
-      return 1;
-    }
-  });
-  useEffect(() => {
-    fx.zoom = zoom;
-    try {
-      localStorage.setItem("song-recorder:zoom", String(zoom));
-    } catch {}
-  }, [fx, zoom]);
+  // Shape of the picture (width / height), from the camera.
+  const [aspect, setAspect] = useState(9 / 16);
   const [sheet, setSheet] = useState<null | "bg" | "sound">(null);
   const [thumbs] = useState(() =>
     Object.fromEntries(
@@ -128,14 +115,16 @@ export default function Recorder({
 
   useEffect(() => {
     fx.onStatus = setFxStatus;
+    fx.onSize = (w, h) => setAspect(w / h);
     return () => {
       fx.onStatus = undefined;
+      fx.onSize = undefined;
       fx.stop();
     };
   }, [fx]);
   useEffect(() => fx.setChoice(bg, customUrl), [fx, bg, customUrl]);
 
-  // The picture (camera cropped to 9:16, plus any background) is drawn on the
+  // The picture (the whole camera picture, plus any background) is drawn on the
   // canvas the whole time the camera is on; that canvas is what gets recorded.
   const cameraOn =
     phase.kind !== "done" &&
@@ -168,7 +157,7 @@ export default function Recorder({
     const portrait = window.matchMedia("(orientation: portrait)").matches;
     navigator.mediaDevices
       .getUserMedia({
-        // Full HD; the picture is cropped to a 9:16 frame for the video.
+        // Full HD, shaped like the screen: tall on a phone, wide on a laptop.
         video: {
           facingMode: "user",
           width: { ideal: portrait ? 1080 : 1920 },
@@ -303,7 +292,7 @@ export default function Recorder({
       ctx.createMediaStreamSource(cam).connect(chain.input);
       chain.output.connect(voiceGain).connect(mix);
 
-      // Record exactly what the preview shows: the 9:16 frame.
+      // Record exactly what the preview shows.
       const canvasTracks = rawCamera
         ? []
         : canvasRef.current!.captureStream(30).getVideoTracks();
@@ -419,9 +408,19 @@ export default function Recorder({
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-black text-white">
-      {/* The stage: a 9:16 frame, exactly what the video will look like. */}
-      <div className="relative flex min-h-0 flex-1 items-center justify-center">
-        <div className="relative aspect-[9/16] h-full max-h-full max-w-full overflow-hidden bg-neutral-900 sm:rounded-3xl sm:my-3 sm:h-[calc(100%-1.5rem)]">
+      {/* The stage: the camera picture's own shape, exactly what the video
+          will look like, as large as fits. */}
+      <div
+        className="relative flex min-h-0 flex-1 items-center justify-center sm:p-3"
+        style={{ containerType: "size" }}
+      >
+        <div
+          className="relative overflow-hidden bg-neutral-900 sm:rounded-3xl"
+          style={{
+            aspectRatio: aspect,
+            width: `min(100cqw, calc(100cqh * ${aspect}))`,
+          }}
+        >
           {phase.kind === "done" ? (
             // A fresh element: reusing the camera's kept its live stream
             // attached, which browsers show as a "Live Broadcast".
@@ -450,7 +449,7 @@ export default function Recorder({
                 playsInline
                 className={
                   rawCamera
-                    ? "absolute inset-0 h-full w-full -scale-x-100 object-cover"
+                    ? "absolute inset-0 h-full w-full -scale-x-100 object-contain"
                     : "pointer-events-none absolute top-0 left-0 h-px w-px opacity-0"
                 }
               />
@@ -502,24 +501,6 @@ export default function Recorder({
               <span className="w-9 shrink-0" />
             )}
           </div>
-
-          {/* Zoom out: how much of you the frame shows */}
-          {phase.kind === "setup" && !rawCamera && (
-            <div className="absolute top-1/3 right-3 flex flex-col gap-1.5 rounded-full bg-black/40 p-1 backdrop-blur-md">
-              {[0.6, 0.8, 1].map((z) => (
-                <button
-                  key={z}
-                  aria-label={`Zoom ${z}x`}
-                  onClick={() => setZoom(z)}
-                  className={`h-9 w-9 rounded-full text-xs font-semibold transition ${
-                    zoom === z ? "bg-white text-black" : "text-white/80"
-                  }`}
-                >
-                  {z}×
-                </button>
-              ))}
-            </div>
-          )}
 
           {/* Background status, so it never fails silently */}
           {cameraOn &&

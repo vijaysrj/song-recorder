@@ -1,9 +1,9 @@
-// The picture that gets recorded: always a 1080×1920 (9:16) frame, the
-// format Instagram Reels, Shorts and WhatsApp Status use, so what you see in
-// the preview is exactly what ends up in the video.
+// The picture that gets recorded: the whole camera picture in its own shape
+// (tall on a phone held upright, wide on a laptop), Full HD, like a normal
+// camera app. What you see in the preview is exactly what ends up in the video.
 //
 // Each camera frame:
-//   1. The camera picture is cropped to 9:16 (centred) into the frame.
+//   1. The camera picture is drawn into the frame, uncropped.
 //   2. With a background effect, a small copy goes to MediaPipe's selfie
 //      segmenter, which says how likely each pixel is to be you. That mask is
 //      softened (edges and frame-to-frame flicker) and scaled up.
@@ -14,10 +14,9 @@
 import type { ImageSegmenter } from "@mediapipe/tasks-vision";
 import { type BackgroundChoice, drawCover, paintBuiltin } from "./backgrounds";
 
-export const OUT_W = 1080;
-export const OUT_H = 1920;
 const SEG_W = 256;
-const SEG_H = Math.round((SEG_W * OUT_H) / OUT_W);
+// Longest side of the recorded picture (Full HD).
+const OUT_LONG = 1920;
 
 let segmenterPromise: Promise<ImageSegmenter> | null = null;
 
@@ -80,8 +79,11 @@ export class BackgroundFx {
   private failures = 0;
   private status: FxStatus = { kind: "plain" };
 
-  /** 1 fills the 9:16 frame with the camera; smaller shows more of the room. */
-  zoom = 1;
+  /** Size of the recorded picture: the camera's own shape, Full HD. */
+  ow = 1080;
+  oh = 1920;
+  /** Told when the picture's shape is known or changes. */
+  onSize?: (w: number, h: number) => void;
 
   /** Average time to process one frame / to segment one frame, in ms. */
   frameMs = 0;
@@ -91,15 +93,15 @@ export class BackgroundFx {
   /** Told whenever the effect's state changes (loading, on, error…). */
   onStatus?: (s: FxStatus) => void;
 
-  private frame = canvas(OUT_W, OUT_H); // camera, cropped to 9:16
-  private small = canvas(SEG_W, SEG_H);
-  private maskC = canvas(SEG_W, SEG_H);
+  private segH = Math.round((SEG_W * 1920) / 1080);
+  private frame = canvas(1080, 1920); // the camera picture
+  private small = canvas(SEG_W, this.segH);
+  private maskC = canvas(SEG_W, this.segH);
   private maskData: ImageData | null = null;
   private prev: Float32Array | null = null;
-  private person = canvas(OUT_W, OUT_H);
+  private person = canvas(1080, 1920);
   private blurA = canvas();
   private blurB = canvas();
-  private fill = canvas(27, 48);
 
   setChoice(choice: BackgroundChoice, customUrl: string | null) {
     this.choice = choice;
@@ -145,12 +147,43 @@ export class BackgroundFx {
     this.onStatus?.(s);
   }
 
+  // Match the picture to the camera's shape (tall on a phone held upright,
+  // wide on a laptop), scaled so the long side is Full HD.
+  private fitTo(W: number, H: number) {
+    const k = OUT_LONG / Math.max(W, H);
+    const ow = Math.round((W * k) / 2) * 2;
+    const oh = Math.round((H * k) / 2) * 2;
+    if (ow === this.ow && oh === this.oh && this.out?.width === ow) return;
+    this.ow = ow;
+    this.oh = oh;
+    this.segH = Math.round((SEG_W * oh) / ow);
+    for (const c of [this.frame, this.person]) {
+      c.width = ow;
+      c.height = oh;
+    }
+    for (const c of [this.small, this.maskC]) {
+      c.width = SEG_W;
+      c.height = this.segH;
+    }
+    this.maskData = null;
+    this.prev = null;
+    this.blurA.width = this.blurB.width = 1; // re-made at the new size
+    this.sceneKey = "";
+    this.sizeOut();
+    this.onSize?.(ow, oh);
+  }
+
+  private sizeOut() {
+    if (!this.out) return;
+    if (this.out.width !== this.ow) this.out.width = this.ow;
+    if (this.out.height !== this.oh) this.out.height = this.oh;
+  }
+
   start(video: HTMLVideoElement, out: HTMLCanvasElement) {
     this.stop();
     this.video = video;
     this.out = out;
-    out.width = OUT_W;
-    out.height = OUT_H;
+    this.sizeOut();
     this.running = true;
     this.prev = null;
     this.lastRenderAt = 0;
@@ -204,56 +237,12 @@ export class BackgroundFx {
     const H = v.videoHeight;
     if (!W || !H || v.readyState < 2) return false;
 
-    // 1. Fit the camera into the 9:16 frame. At zoom 1 it fills the frame
-    //    (cropping the sides); below 1 you're shown smaller, with a soft
-    //    blurred copy of the camera filling any gap.
-    const cover = Math.max(OUT_W / W, OUT_H / H);
-    const scale = cover * this.zoom;
+    // 1. The whole camera picture, as a normal camera app records it.
+    this.fitTo(W, H);
     const fg = ctx2d(this.frame);
     fg.imageSmoothingEnabled = true;
     fg.imageSmoothingQuality = "high";
-    const dw = W * scale;
-    const dh = H * scale;
-    if (dw < OUT_W || dh < OUT_H) {
-      const f = this.fill;
-      const fc = ctx2d(f);
-      const cw = OUT_W / cover;
-      const ch = OUT_H / cover;
-      fc.drawImage(
-        v,
-        (W - cw) / 2,
-        (H - ch) / 2,
-        cw,
-        ch,
-        0,
-        0,
-        f.width,
-        f.height,
-      );
-      fg.drawImage(f, 0, 0, OUT_W, OUT_H);
-      fg.fillStyle = "rgba(0,0,0,0.25)";
-      fg.fillRect(0, 0, OUT_W, OUT_H);
-    }
-    // Centred sideways; vertically a little above centre, where faces are.
-    const dx = (OUT_W - dw) / 2;
-    const dy = (OUT_H - dh) * 0.45;
-    if (dw < OUT_W || dh < OUT_H) {
-      // Smaller than the frame: a rounded, softly shadowed card, so it looks
-      // deliberate rather than letterboxed.
-      fg.save();
-      fg.shadowColor = "rgba(0,0,0,0.45)";
-      fg.shadowBlur = 40;
-      fg.beginPath();
-      fg.roundRect(dx, dy, dw, dh, 36);
-      fg.fillStyle = "#000";
-      fg.fill();
-      fg.shadowColor = "transparent";
-      fg.clip();
-      fg.drawImage(v, dx, dy, dw, dh);
-      fg.restore();
-    } else {
-      fg.drawImage(v, dx, dy, dw, dh);
-    }
+    fg.drawImage(v, 0, 0, this.ow, this.oh);
 
     const og = ctx2d(out);
     const effectOn =
@@ -281,7 +270,7 @@ export class BackgroundFx {
     pg.globalCompositeOperation = "copy";
     pg.imageSmoothingEnabled = true;
     pg.imageSmoothingQuality = "high";
-    pg.drawImage(this.maskC, 0, 0, OUT_W, OUT_H);
+    pg.drawImage(this.maskC, 0, 0, this.ow, this.oh);
     pg.globalCompositeOperation = "source-in";
     pg.drawImage(this.frame, 0, 0);
     pg.globalCompositeOperation = "source-over";
@@ -290,7 +279,7 @@ export class BackgroundFx {
   }
 
   private segment() {
-    ctx2d(this.small).drawImage(this.frame, 0, 0, SEG_W, SEG_H);
+    ctx2d(this.small).drawImage(this.frame, 0, 0, SEG_W, this.segH);
     const ts = Math.max(performance.now(), this.lastTs + 1);
     this.lastTs = ts;
     const t0 = performance.now();
@@ -303,7 +292,7 @@ export class BackgroundFx {
     // Sharpen the in/out decision a little, then blend with the previous
     // frame so edges don't shimmer.
     const mg = ctx2d(this.maskC);
-    this.maskData ??= mg.createImageData(SEG_W, SEG_H);
+    this.maskData ??= mg.createImageData(SEG_W, this.segH);
     const px = this.maskData.data;
     const prev = (this.prev ??= new Float32Array(conf.length));
     for (let i = 0; i < conf.length; i++) {
@@ -319,10 +308,10 @@ export class BackgroundFx {
   // Blur by shrinking and enlarging in steps: works on every browser
   // (canvas blur filters are missing on older iPhones) and is fast.
   private drawBlur(g: CanvasRenderingContext2D, factor: number) {
-    const aw = Math.round(OUT_W / 4);
-    const ah = Math.round(OUT_H / 4);
-    const bw = Math.max(1, Math.round(OUT_W / factor));
-    const bh = Math.max(1, Math.round(OUT_H / factor));
+    const aw = Math.round(this.ow / 4);
+    const ah = Math.round(this.oh / 4);
+    const bw = Math.max(1, Math.round(this.ow / factor));
+    const bh = Math.max(1, Math.round(this.oh / factor));
     if (this.blurA.width !== aw) {
       this.blurA.width = aw;
       this.blurA.height = ah;
@@ -337,7 +326,7 @@ export class BackgroundFx {
     a.drawImage(this.frame, 0, 0, aw, ah);
     b.drawImage(this.blurA, 0, 0, bw, bh);
     a.drawImage(this.blurB, 0, 0, aw, ah);
-    g.drawImage(this.blurA, 0, 0, OUT_W, OUT_H);
+    g.drawImage(this.blurA, 0, 0, this.ow, this.oh);
   }
 
   private sceneFor() {
@@ -346,14 +335,14 @@ export class BackgroundFx {
     if (this.scene && this.sceneKey === key) return this.scene;
     let scene: HTMLCanvasElement;
     if (c.kind === "builtin") {
-      scene = paintBuiltin(c.id, OUT_W, OUT_H);
+      scene = paintBuiltin(c.id, this.ow, this.oh);
     } else {
-      scene = canvas(OUT_W, OUT_H);
+      scene = canvas(this.ow, this.oh);
       const g = ctx2d(scene);
-      if (this.customImg) drawCover(g, this.customImg, OUT_W, OUT_H);
+      if (this.customImg) drawCover(g, this.customImg, this.ow, this.oh);
       else {
         g.fillStyle = "#111";
-        g.fillRect(0, 0, OUT_W, OUT_H);
+        g.fillRect(0, 0, this.ow, this.oh);
       }
     }
     this.scene = scene;
