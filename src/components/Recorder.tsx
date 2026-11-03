@@ -47,9 +47,17 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
   const [reverb, setReverb] = useState(0.3);
   const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
   const [micId, setMicId] = useState("");
+  // Remembered between sessions: whether you sing with headphones on.
+  const [headphones, setHeadphones] = useState(() => {
+    try {
+      return localStorage.getItem("song-recorder:headphones") !== "no";
+    } catch {
+      return true;
+    }
+  });
 
   // Live preview of the front camera while setting up.
-  function startCamera(isCancelled: () => boolean = () => false, mic = micId) {
+  function startCamera(isCancelled: () => boolean = () => false, mic = micId, hp = headphones) {
     const portrait = window.matchMedia("(orientation: portrait)").matches;
     navigator.mediaDevices
       .getUserMedia({
@@ -61,13 +69,15 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
           height: { ideal: portrait ? 1920 : 1080 },
           frameRate: { ideal: 30 },
         },
-        // Raw, full-band voice: with headphones there is no echo to cancel,
-        // and phone call filters make singing sound thin and pumpy. The
+        // With headphones: raw, full-band voice. There is no echo to cancel,
+        // and phone call filters make singing sound thin and pumpy; the
         // studio chain does the polishing instead.
+        // Without headphones: the phone's echo cancelling removes the music
+        // coming out of the speaker, so the video doesn't get it twice.
         audio: {
           ...(mic ? { deviceId: { exact: mic } } : {}),
-          echoCancellation: false,
-          noiseSuppression: false,
+          echoCancellation: !hp,
+          noiseSuppression: !hp,
           autoGainControl: false,
           sampleRate: { ideal: 48000 },
           sampleSize: { ideal: 24 },
@@ -352,6 +362,30 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
                 className="h-5 w-5 accent-pink-500"
               />
             </label>
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>
+                🎧 Wearing headphones
+                <span className="block text-xs text-white/50">
+                  {headphones
+                    ? "Best sound: the mic hears only your voice"
+                    : "Speaker mode: echo cancelling removes the music from the mic"}
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={headphones}
+                onChange={(e) => {
+                  const hp = e.target.checked;
+                  setHeadphones(hp);
+                  try {
+                    localStorage.setItem("song-recorder:headphones", hp ? "yes" : "no");
+                  } catch {}
+                  stopCamera();
+                  startCamera(undefined, micId, hp);
+                }}
+                className="h-5 w-5 accent-pink-500"
+              />
+            </label>
             {mics.length > 1 && (
               <label className="flex items-center gap-3 text-sm">
                 <span className="w-20 shrink-0">🎤 Mic</span>
@@ -360,7 +394,7 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
                   onChange={(e) => {
                     setMicId(e.target.value);
                     stopCamera();
-                    startCamera(undefined, e.target.value);
+                    startCamera(undefined, e.target.value, headphones);
                   }}
                   className="min-w-0 flex-1 rounded-lg bg-white/10 px-2 py-1.5"
                 >
@@ -373,8 +407,9 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
               </label>
             )}
             <p className="text-center text-xs text-white/50">
-              🎧 Use wired headphones so the music stays out of the mic. Bluetooth headphones switch the
-              phone to a low-quality call mic; if you use them, pick the phone&apos;s own mic above.
+              {headphones
+                ? "Wired headphones sound best. Bluetooth headphones switch the phone to a low-quality call mic; if you use them, pick the phone's own mic above."
+                : "Keep the music volume moderate and hold the phone 20–30 cm away. Headphones still give the clearest voice."}
             </p>
             <button onClick={start} className="w-full rounded-xl bg-red-600 py-3.5 text-base font-semibold">
               ● Start recording
