@@ -44,14 +44,15 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
   // Live preview of the front camera while setting up.
   useEffect(() => {
     let cancelled = false;
+    const portrait = window.matchMedia("(orientation: portrait)").matches;
     navigator.mediaDevices
       .getUserMedia({
-        // Ask for the camera's best HD mode. Landscape numbers work on laptops,
-        // and phones swap them automatically when held upright.
+        // Full HD shaped like the screen: tall on a phone held upright,
+        // wide on a laptop.
         video: {
           facingMode: "user",
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
+          width: { ideal: portrait ? 1080 : 1920 },
+          height: { ideal: portrait ? 1920 : 1080 },
           frameRate: { ideal: 30 },
         },
         // Raw voice: with headphones there is no echo to cancel, and these
