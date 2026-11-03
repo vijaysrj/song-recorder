@@ -46,7 +46,14 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
     let cancelled = false;
     navigator.mediaDevices
       .getUserMedia({
-        video: { facingMode: "user", width: { ideal: 720 }, height: { ideal: 1280 } },
+        // Ask for the camera's best HD mode. Landscape numbers work on laptops,
+        // and phones swap them automatically when held upright.
+        video: {
+          facingMode: "user",
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30 },
+        },
         // Raw voice: with headphones there is no echo to cancel, and these
         // filters make singing sound thin.
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
@@ -54,6 +61,8 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       .then((stream) => {
         if (cancelled) return stream.getTracks().forEach((t) => t.stop());
         camRef.current = stream;
+        // Tell the encoder to keep sharpness rather than drop resolution.
+        stream.getVideoTracks().forEach((t) => (t.contentHint = "detail"));
         if (videoRef.current) videoRef.current.srcObject = stream;
       })
       .catch((e) =>
@@ -137,7 +146,7 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       const mimeType = pickMimeType();
       const rec = new MediaRecorder(stream, {
         mimeType,
-        videoBitsPerSecond: 2_500_000,
+        videoBitsPerSecond: 8_000_000,
         audioBitsPerSecond: 192_000,
       });
       recRef.current = rec;
