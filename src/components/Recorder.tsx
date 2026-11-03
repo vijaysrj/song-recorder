@@ -106,6 +106,7 @@ export default function Recorder({
         fxRef.current ??= await BackgroundFx.create();
         (window as unknown as { __fx?: BackgroundFx }).__fx = fxRef.current;
         if (cancelled || !videoRef.current || !fxCanvasRef.current) return;
+        fxRef.current.onError = (m) => setFxError(`Background effect stopped working: ${m}`);
         fxRef.current.setChoice(bg, customUrl);
         fxRef.current.start(videoRef.current, fxCanvasRef.current);
         setFxReady(true);
@@ -266,7 +267,7 @@ export default function Recorder({
 
       // With a background effect, record the processed picture instead of
       // the raw camera.
-      const useFx = bg.kind !== "none" && fxReady && fxCanvasRef.current;
+      const useFx = bg.kind !== "none" && fxReady && !fxError && fxCanvasRef.current;
       const videoTracks = useFx
         ? fxCanvasRef.current!.captureStream(30).getVideoTracks()
         : cam.getVideoTracks();
@@ -387,7 +388,7 @@ export default function Recorder({
               key="fx"
               ref={fxCanvasRef}
               className={`absolute inset-0 h-full w-full -scale-x-100 object-cover ${
-                bg.kind !== "none" && fxReady ? "" : "hidden"
+                bg.kind !== "none" && fxReady && !fxError ? "" : "hidden"
               }`}
             />
             {bg.kind !== "none" && !fxReady && !fxError && (

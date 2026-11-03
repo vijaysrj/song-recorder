@@ -22,18 +22,15 @@ function loadSegmenter() {
   segmenterPromise ??= (async () => {
     const { FilesetResolver, ImageSegmenter } = await import("@mediapipe/tasks-vision");
     const fileset = await FilesetResolver.forVisionTasks("/mediapipe");
-    const make = (delegate: "GPU" | "CPU") =>
-      ImageSegmenter.createFromOptions(fileset, {
-        baseOptions: { modelAssetPath: "/models/selfie_segmenter.tflite", delegate },
-        runningMode: "VIDEO",
-        outputConfidenceMasks: true,
-        outputCategoryMask: false,
-      });
-    try {
-      return await make("GPU");
-    } catch {
-      return await make("CPU");
-    }
+    // CPU on purpose: the model is tiny (256 px wide input, a few ms per
+    // frame), and reading GPU masks back fails on some phones (iPhones lack
+    // the float-texture support it needs).
+    return ImageSegmenter.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: "/models/selfie_segmenter.tflite", delegate: "CPU" },
+      runningMode: "VIDEO",
+      outputConfidenceMasks: true,
+      outputCategoryMask: false,
+    });
   })();
   segmenterPromise.catch(() => (segmenterPromise = null));
   return segmenterPromise;
@@ -70,6 +67,10 @@ export class BackgroundFx {
   frameMs = 0;
   segMs = 0;
   private frameNo = 0;
+  private lastVideoTime = -1;
+  private failures = 0;
+  /** Called once if frames keep failing, with the error message. */
+  onError?: (message: string) => void;
 
   private small = canvas();
   private maskC = canvas();
@@ -110,36 +111,38 @@ export class BackgroundFx {
     this.out = out;
     this.running = true;
     this.prev = null;
+    this.lastVideoTime = -1;
+    this.failures = 0;
     this.schedule();
   }
 
   stop() {
     this.running = false;
-    if (this.video && "cancelVideoFrameCallback" in this.video && this.frameHandle) {
-      this.video.cancelVideoFrameCallback(this.frameHandle);
-    } else if (this.frameHandle) {
-      cancelAnimationFrame(this.frameHandle);
-    }
+    if (this.frameHandle) cancelAnimationFrame(this.frameHandle);
     this.frameHandle = 0;
   }
 
+  // requestAnimationFrame works the same on every browser; only frames
+  // the camera has actually changed get processed.
   private schedule() {
     if (!this.running || !this.video) return;
-    const v = this.video;
-    if ("requestVideoFrameCallback" in v) {
-      this.frameHandle = v.requestVideoFrameCallback(() => this.frame());
-    } else {
-      this.frameHandle = requestAnimationFrame(() => this.frame());
-    }
+    this.frameHandle = requestAnimationFrame(() => this.frame());
   }
 
   private frame() {
-    try {
-      const t = performance.now();
-      this.render();
-      this.frameMs = 0.9 * this.frameMs + 0.1 * (performance.now() - t);
-    } catch (e) {
-      console.warn("background effect frame failed", e);
+    const v = this.video;
+    if (v && v.currentTime !== this.lastVideoTime) {
+      this.lastVideoTime = v.currentTime;
+      try {
+        const t = performance.now();
+        this.render();
+        this.frameMs = 0.9 * this.frameMs + 0.1 * (performance.now() - t);
+        this.failures = 0;
+      } catch (e) {
+        console.warn("background effect frame failed", e);
+        // Don't fail silently: after repeated errors, tell the screen.
+        if (++this.failures === 10) this.onError?.((e as Error)?.message || String(e));
+      }
     }
     this.schedule();
   }
