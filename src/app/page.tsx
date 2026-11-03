@@ -14,7 +14,12 @@ export default function Home() {
   return (
     <main className="mx-auto w-full max-w-md flex-1 space-y-6 px-4 py-6">
       <header>
-        <h1 className="text-2xl font-bold">🎤 Song Recorder</h1>
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold">🎤 Song Recorder</h1>
+          <a href="/api/auth/logout" className="text-sm text-white/50">
+            Sign out
+          </a>
+        </div>
         <p className="text-sm text-white/60">Add a song, paste the lyrics, then tap Sing to record yourself.</p>
       </header>
       <AddSong onAdded={(s) => update([s, ...songs])} />
