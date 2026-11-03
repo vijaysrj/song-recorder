@@ -33,6 +33,12 @@ export default function SongList({
             </button>
           </div>
           <audio controls preload="none" src={s.trackUrl} className="w-full" />
+          <a
+            href={`${s.trackUrl}${s.trackUrl.includes("?") ? "&" : "?"}download=1`}
+            className="mt-2 inline-block text-sm text-pink-400"
+          >
+            ⬇ Download karaoke track
+          </a>
 
           {editing === s.id ? (
             <textarea

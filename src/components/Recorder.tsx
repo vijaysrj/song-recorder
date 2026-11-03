@@ -42,8 +42,7 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
   const [duration, setDuration] = useState(0);
 
   // Live preview of the front camera while setting up.
-  useEffect(() => {
-    let cancelled = false;
+  function startCamera(isCancelled: () => boolean = () => false) {
     const portrait = window.matchMedia("(orientation: portrait)").matches;
     navigator.mediaDevices
       .getUserMedia({
@@ -60,7 +59,7 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
       })
       .then((stream) => {
-        if (cancelled) return stream.getTracks().forEach((t) => t.stop());
+        if (isCancelled()) return stream.getTracks().forEach((t) => t.stop());
         camRef.current = stream;
         // Tell the encoder to keep sharpness rather than drop resolution.
         stream.getVideoTracks().forEach((t) => (t.contentHint = "detail"));
@@ -69,10 +68,22 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       .catch((e) =>
         setPhase({ kind: "error", message: `Camera or microphone blocked: ${(e as Error).message}` }),
       );
+  }
+
+  function stopCamera() {
+    camRef.current?.getTracks().forEach((t) => t.stop());
+    camRef.current = null;
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    startCamera(() => cancelled);
     return () => {
       cancelled = true;
       cleanup();
     };
+    // Run once: open the camera on mount, release everything on unmount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -87,7 +98,7 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       musicRef.current?.stop();
     } catch {}
     if (recRef.current?.state === "recording") recRef.current.stop();
-    camRef.current?.getTracks().forEach((t) => t.stop());
+    stopCamera();
     ctxRef.current?.close().catch(() => {});
     wakeRef.current?.release().catch(() => {});
   }
@@ -162,6 +173,9 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
           ext: type.includes("mp4") ? "mp4" : "webm",
         });
         wakeRef.current?.release().catch(() => {});
+        // Recording is over: switch the camera and mic off and silence audio.
+        stopCamera();
+        ctx.close().catch(() => {});
       };
 
       wakeRef.current = (await navigator.wakeLock?.request("screen").catch(() => null)) ?? null;
@@ -188,6 +202,12 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
   }
 
   function stopEarly() {
+    // Silence the music at once, then stop it (which also ends the recording).
+    const ctx = ctxRef.current;
+    if (musicGainRef.current && ctx) {
+      musicGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
+      musicGainRef.current.gain.setValueAtTime(0, ctx.currentTime);
+    }
     try {
       musicRef.current?.stop(); // triggers onended, which stops the recorder
     } catch {}
@@ -198,6 +218,7 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
     ctxRef.current?.close().catch(() => {});
     setElapsed(0);
     setPhase({ kind: "setup" });
+    startCamera();
   }
 
   const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
@@ -208,9 +229,20 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       {/* Camera preview (mirrored like a selfie) or the finished recording */}
       <div className="relative min-h-0 flex-1 overflow-hidden">
         {phase.kind === "done" ? (
-          <video src={phase.url} controls playsInline className="h-full w-full object-contain" />
+          // The key makes React build a fresh element. Reusing the camera's
+          // element kept its live stream attached, which browsers show as a
+          // "Live Broadcast" instead of your recording.
+          <video
+            key="playback"
+            src={phase.url}
+            controls
+            playsInline
+            onLoadedMetadata={fixUnknownDuration}
+            className="h-full w-full object-contain"
+          />
         ) : (
           <video
+            key="camera"
             ref={(el) => {
               videoRef.current = el;
               if (el && camRef.current && el.srcObject !== camRef.current) el.srcObject = camRef.current;
@@ -303,6 +335,21 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       </div>
     </div>
   );
+}
+
+// Browser recordings often don't store their length, so Safari labels them
+// "Live Broadcast" and the seek bar doesn't work. Jumping far past the end
+// makes the browser scan the file and learn the real length; then rewind.
+function fixUnknownDuration(e: React.SyntheticEvent<HTMLVideoElement>) {
+  const v = e.currentTarget;
+  if (Number.isFinite(v.duration)) return;
+  const rewind = () => {
+    if (!Number.isFinite(v.duration)) return;
+    v.removeEventListener("durationchange", rewind);
+    v.currentTime = 0;
+  };
+  v.addEventListener("durationchange", rewind);
+  v.currentTime = 1e101;
 }
 
 function Slider({
