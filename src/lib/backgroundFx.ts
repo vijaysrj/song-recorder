@@ -1,18 +1,23 @@
-// Live background blur / replacement, run entirely on the device.
+// The picture that gets recorded: always a 1080×1920 (9:16) frame, the
+// format Instagram Reels, Shorts and WhatsApp Status use, so what you see in
+// the preview is exactly what ends up in the video.
 //
 // Each camera frame:
-//   1. A small copy goes to MediaPipe's selfie segmenter, which returns how
-//      likely each pixel is to be you.
-//   2. That mask is softened (edges and frame-to-frame flicker) and scaled up.
+//   1. The camera picture is cropped to 9:16 (centred) into the frame.
+//   2. With a background effect, a small copy goes to MediaPipe's selfie
+//      segmenter, which says how likely each pixel is to be you. That mask is
+//      softened (edges and frame-to-frame flicker) and scaled up.
 //   3. The background (blurred camera, a built-in scene or your photo) is
 //      drawn, then you are drawn on top through the mask at full resolution.
-// The result is drawn to a canvas, which the recorder records instead of the
-// raw camera.
+// Everything runs on the device.
 
 import type { ImageSegmenter } from "@mediapipe/tasks-vision";
 import { type BackgroundChoice, drawCover, paintBuiltin } from "./backgrounds";
 
-const SEG_WIDTH = 256;
+export const OUT_W = 1080;
+export const OUT_H = 1920;
+const SEG_W = 256;
+const SEG_H = Math.round((SEG_W * OUT_H) / OUT_W);
 
 let segmenterPromise: Promise<ImageSegmenter> | null = null;
 
@@ -20,13 +25,17 @@ let segmenterPromise: Promise<ImageSegmenter> | null = null;
 // scripts/copy-mediapipe.mjs), so nothing comes from other sites.
 function loadSegmenter() {
   segmenterPromise ??= (async () => {
-    const { FilesetResolver, ImageSegmenter } = await import("@mediapipe/tasks-vision");
+    const { FilesetResolver, ImageSegmenter } =
+      await import("@mediapipe/tasks-vision");
     const fileset = await FilesetResolver.forVisionTasks("/mediapipe");
     // CPU on purpose: the model is tiny (256 px wide input, a few ms per
     // frame), and reading GPU masks back fails on some phones (iPhones lack
     // the float-texture support it needs).
     return ImageSegmenter.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: "/models/selfie_segmenter.tflite", delegate: "CPU" },
+      baseOptions: {
+        modelAssetPath: "/models/selfie_segmenter.tflite",
+        delegate: "CPU",
+      },
       runningMode: "VIDEO",
       outputConfidenceMasks: true,
       outputCategoryMask: false,
@@ -34,10 +43,6 @@ function loadSegmenter() {
   })();
   segmenterPromise.catch(() => (segmenterPromise = null));
   return segmenterPromise;
-}
-
-export function preloadBackgroundFx() {
-  return loadSegmenter().then(() => undefined);
 }
 
 function canvas(w = 1, h = 1) {
@@ -48,11 +53,18 @@ function canvas(w = 1, h = 1) {
 }
 
 function ctx2d(c: HTMLCanvasElement) {
-  return c.getContext("2d", { willReadFrequently: false })!;
+  return c.getContext("2d")!;
 }
 
+export type FxStatus =
+  | { kind: "plain" } // no effect chosen
+  | { kind: "loading" } // effect chosen, tools still downloading
+  | { kind: "on" } // effect running
+  | { kind: "error"; message: string };
+
 export class BackgroundFx {
-  private seg: ImageSegmenter;
+  private seg: ImageSegmenter | null = null;
+  private segLoading = false;
   private video: HTMLVideoElement | null = null;
   private out: HTMLCanvasElement | null = null;
   private choice: BackgroundChoice = { kind: "none" };
@@ -63,33 +75,31 @@ export class BackgroundFx {
   private running = false;
   private lastTs = 0;
   private frameHandle = 0;
-  /** Average time to process one frame, in ms (for checking speed). */
+  private frameNo = 0;
+  private lastRenderAt = 0;
+  private failures = 0;
+  private status: FxStatus = { kind: "plain" };
+
+  /** Average time to process one frame / to segment one frame, in ms. */
   frameMs = 0;
   segMs = 0;
-  private frameNo = 0;
-  private lastVideoTime = -1;
-  private failures = 0;
-  /** Called once if frames keep failing, with the error message. */
-  onError?: (message: string) => void;
+  /** Frames drawn since start(); stays 0 if the camera never delivers a picture. */
+  framesRendered = 0;
+  /** Told whenever the effect's state changes (loading, on, error…). */
+  onStatus?: (s: FxStatus) => void;
 
-  private small = canvas();
-  private maskC = canvas();
+  private frame = canvas(OUT_W, OUT_H); // camera, cropped to 9:16
+  private small = canvas(SEG_W, SEG_H);
+  private maskC = canvas(SEG_W, SEG_H);
   private maskData: ImageData | null = null;
   private prev: Float32Array | null = null;
-  private person = canvas();
+  private person = canvas(OUT_W, OUT_H);
   private blurA = canvas();
   private blurB = canvas();
 
-  private constructor(seg: ImageSegmenter) {
-    this.seg = seg;
-  }
-
-  static async create() {
-    return new BackgroundFx(await loadSegmenter());
-  }
-
   setChoice(choice: BackgroundChoice, customUrl: string | null) {
     this.choice = choice;
+    this.failures = 0;
     if (customUrl !== this.customUrl) {
       this.customUrl = customUrl;
       this.customImg = null;
@@ -103,15 +113,44 @@ export class BackgroundFx {
         img.src = customUrl;
       }
     }
+    if (choice.kind === "none") this.setStatus({ kind: "plain" });
+    else if (this.seg) this.setStatus({ kind: "on" });
+    else this.loadSeg();
+  }
+
+  private loadSeg() {
+    this.setStatus({ kind: "loading" });
+    if (this.segLoading) return;
+    this.segLoading = true;
+    loadSegmenter()
+      .then((seg) => {
+        this.seg = seg;
+        if (this.choice.kind !== "none") this.setStatus({ kind: "on" });
+      })
+      .catch((e) =>
+        this.setStatus({
+          kind: "error",
+          message: `Couldn't load backgrounds (${(e as Error).message})`,
+        }),
+      )
+      .finally(() => (this.segLoading = false));
+  }
+
+  private setStatus(s: FxStatus) {
+    this.status = s;
+    this.onStatus?.(s);
   }
 
   start(video: HTMLVideoElement, out: HTMLCanvasElement) {
     this.stop();
     this.video = video;
     this.out = out;
+    out.width = OUT_W;
+    out.height = OUT_H;
     this.running = true;
     this.prev = null;
-    this.lastVideoTime = -1;
+    this.lastRenderAt = 0;
+    this.framesRendered = 0;
     this.failures = 0;
     this.schedule();
   }
@@ -122,85 +161,102 @@ export class BackgroundFx {
     this.frameHandle = 0;
   }
 
-  // requestAnimationFrame works the same on every browser; only frames
-  // the camera has actually changed get processed.
+  // requestAnimationFrame behaves the same on every browser.
   private schedule() {
-    if (!this.running || !this.video) return;
-    this.frameHandle = requestAnimationFrame(() => this.frame());
+    if (!this.running) return;
+    this.frameHandle = requestAnimationFrame(() => this.tick());
   }
 
-  private frame() {
-    const v = this.video;
-    if (v && v.currentTime !== this.lastVideoTime) {
-      this.lastVideoTime = v.currentTime;
+  private tick() {
+    // Up to ~30 frames a second (screens refresh faster than cameras).
+    const now = performance.now();
+    if (now - this.lastRenderAt >= 30) {
+      this.lastRenderAt = now;
       try {
-        const t = performance.now();
-        this.render();
-        this.frameMs = 0.9 * this.frameMs + 0.1 * (performance.now() - t);
+        const drawn = this.render();
+        this.frameMs = 0.9 * this.frameMs + 0.1 * (performance.now() - now);
+        if (drawn) this.framesRendered++;
         this.failures = 0;
       } catch (e) {
-        console.warn("background effect frame failed", e);
-        // Don't fail silently: after repeated errors, tell the screen.
-        if (++this.failures === 10) this.onError?.((e as Error)?.message || String(e));
+        console.warn("video frame failed", e);
+        // Don't fail silently: after repeated errors, fall back to the plain
+        // camera and tell the screen why.
+        if (++this.failures === 10 && this.choice.kind !== "none") {
+          this.setStatus({
+            kind: "error",
+            message: `Background stopped working (${(e as Error)?.message ?? e})`,
+          });
+        }
       }
     }
     this.schedule();
   }
 
-  private render() {
-    const v = this.video!;
-    const out = this.out!;
+  private render(): boolean {
+    const v = this.video;
+    const out = this.out;
+    if (!v || !out) return false;
     const W = v.videoWidth;
     const H = v.videoHeight;
-    if (!W || !H || v.readyState < 2) return;
+    if (!W || !H || v.readyState < 2) return false;
 
-    if (out.width !== W || out.height !== H) {
-      out.width = W;
-      out.height = H;
-      this.person.width = W;
-      this.person.height = H;
-      this.sceneKey = "";
-    }
+    // 1. Crop the camera to 9:16, centred.
+    const scale = Math.max(OUT_W / W, OUT_H / H);
+    const sw = OUT_W / scale;
+    const sh = OUT_H / scale;
+    const fg = ctx2d(this.frame);
+    fg.imageSmoothingQuality = "high";
+    fg.drawImage(v, (W - sw) / 2, (H - sh) / 2, sw, sh, 0, 0, OUT_W, OUT_H);
+
     const og = ctx2d(out);
-
-    if (this.choice.kind === "none") {
-      og.drawImage(v, 0, 0, W, H);
-      return;
+    const effectOn =
+      this.choice.kind !== "none" && this.seg && this.status.kind !== "error";
+    if (!effectOn) {
+      og.drawImage(this.frame, 0, 0);
+      return true;
     }
 
-    // 1. Segment a small copy of the frame.
-    const sw = SEG_WIDTH;
-    const sh = Math.max(1, Math.round((SEG_WIDTH * H) / W));
-    if (this.small.width !== sw || this.small.height !== sh) {
-      this.small.width = this.maskC.width = sw;
-      this.small.height = this.maskC.height = sh;
-      this.maskData = null;
-      this.prev = null;
-    }
-    // On slower phones, find the outline every other frame and reuse it in
-    // between, so the picture itself stays smooth.
+    // 2. Find you. On slower phones, every other frame, reusing the outline
+    //    in between so the picture itself stays smooth.
     this.frameNo++;
     const skipSeg = this.segMs > 30 && this.frameNo % 2 === 1 && this.prev;
-    if (!skipSeg) this.segment(sw, sh);
-    this.composite(v, W, H, og);
+    if (!skipSeg) this.segment();
+
+    // 3. Background.
+    og.imageSmoothingEnabled = true;
+    og.imageSmoothingQuality = "high";
+    if (this.choice.kind === "blur")
+      this.drawBlur(og, this.choice.strength === "strong" ? 48 : 28);
+    else og.drawImage(this.sceneFor(), 0, 0);
+
+    // 4. You, through the mask, at full resolution.
+    const pg = ctx2d(this.person);
+    pg.globalCompositeOperation = "copy";
+    pg.imageSmoothingEnabled = true;
+    pg.imageSmoothingQuality = "high";
+    pg.drawImage(this.maskC, 0, 0, OUT_W, OUT_H);
+    pg.globalCompositeOperation = "source-in";
+    pg.drawImage(this.frame, 0, 0);
+    pg.globalCompositeOperation = "source-over";
+    og.drawImage(this.person, 0, 0);
+    return true;
   }
 
-  private segment(sw: number, sh: number) {
-    const v = this.video!;
-    ctx2d(this.small).drawImage(v, 0, 0, sw, sh);
+  private segment() {
+    ctx2d(this.small).drawImage(this.frame, 0, 0, SEG_W, SEG_H);
     const ts = Math.max(performance.now(), this.lastTs + 1);
     this.lastTs = ts;
     const t0 = performance.now();
-    const result = this.seg.segmentForVideo(this.small, ts);
+    const result = this.seg!.segmentForVideo(this.small, ts);
     const conf = result.confidenceMasks?.[0]?.getAsFloat32Array();
     result.close();
     this.segMs = 0.9 * this.segMs + 0.1 * (performance.now() - t0);
     if (!conf) return;
 
-    // 2. Soften: sharpen the in/out decision a little, then blend with the
-    //    previous frame so edges don't shimmer.
+    // Sharpen the in/out decision a little, then blend with the previous
+    // frame so edges don't shimmer.
     const mg = ctx2d(this.maskC);
-    this.maskData ??= mg.createImageData(sw, sh);
+    this.maskData ??= mg.createImageData(SEG_W, SEG_H);
     const px = this.maskData.data;
     const prev = (this.prev ??= new Float32Array(conf.length));
     for (let i = 0; i < conf.length; i++) {
@@ -213,63 +269,44 @@ export class BackgroundFx {
     mg.putImageData(this.maskData, 0, 0);
   }
 
-  private composite(v: HTMLVideoElement, W: number, H: number, og: CanvasRenderingContext2D) {
-    // 3. Background.
-    og.imageSmoothingEnabled = true;
-    og.imageSmoothingQuality = "high";
-    if (this.choice.kind === "blur") this.drawBlur(og, v, W, H, this.choice.strength === "strong" ? 40 : 20);
-    else og.drawImage(this.sceneFor(W, H), 0, 0);
-
-    // 4. You, through the mask, at full resolution.
-    const pg = ctx2d(this.person);
-    pg.globalCompositeOperation = "copy";
-    pg.imageSmoothingEnabled = true;
-    pg.imageSmoothingQuality = "high";
-    pg.drawImage(this.maskC, 0, 0, W, H);
-    pg.globalCompositeOperation = "source-in";
-    pg.drawImage(v, 0, 0, W, H);
-    pg.globalCompositeOperation = "source-over";
-    og.drawImage(this.person, 0, 0);
-  }
-
   // Blur by shrinking and enlarging in steps: works on every browser
   // (canvas blur filters are missing on older iPhones) and is fast.
-  private drawBlur(g: CanvasRenderingContext2D, v: HTMLVideoElement, W: number, H: number, factor: number) {
-    const aw = Math.max(1, Math.round(W / 4));
-    const ah = Math.max(1, Math.round(H / 4));
-    const bw = Math.max(1, Math.round(W / factor));
-    const bh = Math.max(1, Math.round(H / factor));
-    if (this.blurA.width !== aw || this.blurA.height !== ah) {
+  private drawBlur(g: CanvasRenderingContext2D, factor: number) {
+    const aw = Math.round(OUT_W / 4);
+    const ah = Math.round(OUT_H / 4);
+    const bw = Math.max(1, Math.round(OUT_W / factor));
+    const bh = Math.max(1, Math.round(OUT_H / factor));
+    if (this.blurA.width !== aw) {
       this.blurA.width = aw;
       this.blurA.height = ah;
     }
-    if (this.blurB.width !== bw || this.blurB.height !== bh) {
+    if (this.blurB.width !== bw) {
       this.blurB.width = bw;
       this.blurB.height = bh;
     }
     const a = ctx2d(this.blurA);
     const b = ctx2d(this.blurB);
     a.imageSmoothingQuality = b.imageSmoothingQuality = "high";
-    a.drawImage(v, 0, 0, aw, ah);
+    a.drawImage(this.frame, 0, 0, aw, ah);
     b.drawImage(this.blurA, 0, 0, bw, bh);
     a.drawImage(this.blurB, 0, 0, aw, ah);
-    g.drawImage(this.blurA, 0, 0, W, H);
+    g.drawImage(this.blurA, 0, 0, OUT_W, OUT_H);
   }
 
-  private sceneFor(W: number, H: number) {
+  private sceneFor() {
     const c = this.choice;
-    const key = `${c.kind}:${c.kind === "builtin" ? c.id : ""}:${W}x${H}:${this.customImg ? 1 : 0}`;
+    const key = `${c.kind}:${c.kind === "builtin" ? c.id : ""}:${this.customImg ? 1 : 0}`;
     if (this.scene && this.sceneKey === key) return this.scene;
     let scene: HTMLCanvasElement;
     if (c.kind === "builtin") {
-      scene = paintBuiltin(c.id, W, H);
+      scene = paintBuiltin(c.id, OUT_W, OUT_H);
     } else {
-      scene = canvas(W, H);
+      scene = canvas(OUT_W, OUT_H);
       const g = ctx2d(scene);
-      if (this.customImg) drawCover(g, this.customImg, W, H);
+      if (this.customImg) drawCover(g, this.customImg, OUT_W, OUT_H);
       else {
         g.fillStyle = "#111";
-        g.fillRect(0, 0, W, H);
+        g.fillRect(0, 0, OUT_W, OUT_H);
       }
     }
     this.scene = scene;

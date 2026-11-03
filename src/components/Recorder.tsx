@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import type { Song } from "@/lib/library";
 import TimedLyrics from "./TimedLyrics";
 import { buildVocalChain } from "@/lib/vocalChain";
-import { BackgroundFx } from "@/lib/backgroundFx";
+import { BackgroundFx, type FxStatus } from "@/lib/backgroundFx";
+import { toShareableMp4 } from "@/lib/finalizeVideo";
 import {
   type BackgroundChoice,
   BUILTINS,
@@ -20,7 +21,8 @@ type Phase =
   | { kind: "loading" }
   | { kind: "countdown"; n: number }
   | { kind: "recording" }
-  | { kind: "done"; url: string; ext: string }
+  | { kind: "finishing"; progress: number }
+  | { kind: "done"; url: string; ext: string; blob: Blob }
   | { kind: "error"; message: string };
 
 // Prefer MP4 (plays everywhere, Instagram and WhatsApp accept it), else WebM.
@@ -39,6 +41,19 @@ function pickMimeType() {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const fmt = (s: number) =>
+  `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+const BG_OPTIONS: { key: string; label: string; c: BackgroundChoice }[] = [
+  { key: "none", label: "None", c: { kind: "none" } },
+  { key: "blur", label: "Blur", c: { kind: "blur", strength: "light" } },
+  { key: "blur2", label: "More blur", c: { kind: "blur", strength: "strong" } },
+  ...BUILTINS.map((b) => ({
+    key: b.id,
+    label: b.label,
+    c: { kind: "builtin", id: b.id } as BackgroundChoice,
+  })),
+];
 
 export default function Recorder({
   song,
@@ -47,7 +62,8 @@ export default function Recorder({
   song: Song;
   onClose: () => void;
 }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const camRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const musicRef = useRef<AudioBufferSourceNode | null>(null);
@@ -56,8 +72,7 @@ export default function Recorder({
   const voiceGainRef = useRef<GainNode | null>(null);
   const wakeRef = useRef<WakeLockSentinel | null>(null);
   const setReverbRef = useRef<(v: number) => void>(() => {});
-  const fxRef = useRef<BackgroundFx | null>(null);
-  const fxCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [fx] = useState(() => new BackgroundFx());
 
   const [phase, setPhase] = useState<Phase>({ kind: "setup" });
   const [voice, setVoice] = useState(1);
@@ -80,11 +95,14 @@ export default function Recorder({
   // Background blur / virtual background, remembered on this device.
   const [bg, setBg] = useState<BackgroundChoice>(loadChoice);
   const [customUrl, setCustomUrl] = useState<string | null>(loadCustomImage);
-  const [fxReady, setFxReady] = useState(false);
-  const [fxError, setFxError] = useState("");
+  const [fxStatus, setFxStatus] = useState<FxStatus>({ kind: "plain" });
+  // True if the processed picture never appears; then the raw camera is
+  // shown and recorded instead, so you can still sing.
+  const [rawCamera, setRawCamera] = useState(false);
+  const [sheet, setSheet] = useState<null | "bg" | "sound">(null);
   const [thumbs] = useState(() =>
     Object.fromEntries(
-      BUILTINS.map((b) => [b.id, paintBuiltin(b.id, 72, 96).toDataURL()]),
+      BUILTINS.map((b) => [b.id, paintBuiltin(b.id, 72, 128).toDataURL()]),
     ),
   );
 
@@ -93,33 +111,38 @@ export default function Recorder({
     saveChoice(c);
   }
 
-  const fxActive =
-    bg.kind !== "none" && phase.kind !== "done" && phase.kind !== "error";
   useEffect(() => {
-    if (!fxActive) {
-      fxRef.current?.stop();
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      try {
-        fxRef.current ??= await BackgroundFx.create();
-        (window as unknown as { __fx?: BackgroundFx }).__fx = fxRef.current;
-        if (cancelled || !videoRef.current || !fxCanvasRef.current) return;
-        fxRef.current.onError = (m) => setFxError(`Background effect stopped working: ${m}`);
-        fxRef.current.setChoice(bg, customUrl);
-        fxRef.current.start(videoRef.current, fxCanvasRef.current);
-        setFxReady(true);
-      } catch (e) {
-        setFxError(
-          `Backgrounds aren't available on this browser (${(e as Error).message}).`,
-        );
-      }
-    })();
+    fx.onStatus = setFxStatus;
     return () => {
-      cancelled = true;
+      fx.onStatus = undefined;
+      fx.stop();
     };
-  }, [fxActive, bg, customUrl]);
+  }, [fx]);
+  useEffect(() => fx.setChoice(bg, customUrl), [fx, bg, customUrl]);
+
+  // The picture (camera cropped to 9:16, plus any background) is drawn on the
+  // canvas the whole time the camera is on; that canvas is what gets recorded.
+  const cameraOn =
+    phase.kind !== "done" &&
+    phase.kind !== "finishing" &&
+    phase.kind !== "error";
+  useEffect(() => {
+    if (!cameraOn || !videoRef.current || !canvasRef.current) return;
+    fx.start(videoRef.current, canvasRef.current);
+    let checks = 0;
+    const watchdog = setInterval(() => {
+      if (fx.framesRendered > 0) return clearInterval(watchdog);
+      const v = videoRef.current;
+      if (v && v.readyState >= 2 && ++checks >= 3) {
+        clearInterval(watchdog);
+        setRawCamera(true);
+      }
+    }, 1000);
+    return () => {
+      clearInterval(watchdog);
+      fx.stop();
+    };
+  }, [cameraOn, fx]);
 
   // Live preview of the front camera while setting up.
   function startCamera(
@@ -130,8 +153,7 @@ export default function Recorder({
     const portrait = window.matchMedia("(orientation: portrait)").matches;
     navigator.mediaDevices
       .getUserMedia({
-        // Full HD shaped like the screen: tall on a phone held upright,
-        // wide on a laptop.
+        // Full HD; the picture is cropped to a 9:16 frame for the video.
         video: {
           facingMode: "user",
           width: { ideal: portrait ? 1080 : 1920 },
@@ -156,7 +178,6 @@ export default function Recorder({
       .then((stream) => {
         if (isCancelled()) return stream.getTracks().forEach((t) => t.stop());
         camRef.current = stream;
-        // Tell the encoder to keep sharpness rather than drop resolution.
         stream.getVideoTracks().forEach((t) => (t.contentHint = "detail"));
         if (videoRef.current) videoRef.current.srcObject = stream;
         navigator.mediaDevices
@@ -204,6 +225,7 @@ export default function Recorder({
     } catch {}
     if (recRef.current?.state === "recording") recRef.current.stop();
     stopCamera();
+    fx.stop();
     ctxRef.current?.close().catch(() => {});
     wakeRef.current?.release().catch(() => {});
   }
@@ -211,6 +233,7 @@ export default function Recorder({
   async function start() {
     const cam = camRef.current;
     if (!cam) return;
+    setSheet(null);
     try {
       setPhase({ kind: "loading" });
       // Must be created inside the tap so phones allow sound.
@@ -229,7 +252,7 @@ export default function Recorder({
       //   mic   -> studio vocal chain -> voiceGain -> mix
       const mixOut = ctx.createMediaStreamDestination();
       // Limiter so loud notes (or voice turned up) never clip, with a little
-      // headroom left for the MP4 encoder.
+      // headroom left for the encoder.
       const mix = ctx.createDynamicsCompressor();
       mix.threshold.value = -8;
       mix.knee.value = 4;
@@ -265,12 +288,11 @@ export default function Recorder({
       ctx.createMediaStreamSource(cam).connect(chain.input);
       chain.output.connect(voiceGain).connect(mix);
 
-      // With a background effect, record the processed picture instead of
-      // the raw camera.
-      const useFx = bg.kind !== "none" && fxReady && !fxError && fxCanvasRef.current;
-      const videoTracks = useFx
-        ? fxCanvasRef.current!.captureStream(30).getVideoTracks()
-        : cam.getVideoTracks();
+      // Record exactly what the preview shows: the 9:16 frame.
+      const canvasTracks = rawCamera
+        ? []
+        : canvasRef.current!.captureStream(30).getVideoTracks();
+      const videoTracks = rawCamera ? cam.getVideoTracks() : canvasTracks;
       const stream = new MediaStream([
         ...videoTracks,
         ...mixOut.stream.getAudioTracks(),
@@ -284,19 +306,31 @@ export default function Recorder({
       recRef.current = rec;
       const chunks: Blob[] = [];
       rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-      rec.onstop = () => {
+      rec.onstop = async () => {
+        wakeRef.current?.release().catch(() => {});
+        // Recording is over: switch the camera and mic off and silence audio.
+        canvasTracks.forEach((t) => t.stop());
+        stopCamera();
+        fx.stop();
+        ctx.close().catch(() => {});
         const type = rec.mimeType || mimeType || "video/webm";
-        const blob = new Blob(chunks, { type });
+        const raw = new Blob(chunks, { type });
+        // Turn it into a standard MP4 that Instagram and WhatsApp accept.
+        setPhase({ kind: "finishing", progress: 0 });
+        let blob = raw;
+        try {
+          blob = await toShareableMp4(raw, (p) =>
+            setPhase({ kind: "finishing", progress: p }),
+          );
+        } catch (e) {
+          console.warn("MP4 conversion failed, keeping the original", e);
+        }
         setPhase({
           kind: "done",
           url: URL.createObjectURL(blob),
-          ext: type.includes("mp4") ? "mp4" : "webm",
+          ext: blob.type.includes("mp4") ? "mp4" : "webm",
+          blob,
         });
-        wakeRef.current?.release().catch(() => {});
-        // Recording is over: switch the camera and mic off and silence audio.
-        stopCamera();
-        if (useFx) videoTracks.forEach((t) => t.stop());
-        ctx.close().catch(() => {});
       };
 
       wakeRef.current =
@@ -346,270 +380,392 @@ export default function Recorder({
     startCamera();
   }
 
+  const fileName = (ext: string) =>
+    `${song.title.replace(/[\\/:*?"<>|]+/g, " ").trim() || "song"}.${ext}`;
+  const canShareFile = (blob: Blob, ext: string) => {
+    try {
+      const file = new File([blob], fileName(ext), { type: blob.type });
+      return !!navigator.canShare?.({ files: [file] });
+    } catch {
+      return false;
+    }
+  };
+  async function share(blob: Blob, ext: string) {
+    const file = new File([blob], fileName(ext), { type: blob.type });
+    try {
+      await navigator.share({ files: [file], title: song.title });
+    } catch {}
+  }
+
   const cam0MicId = () =>
     camRef.current?.getAudioTracks()[0]?.getSettings().deviceId ?? "";
-
-  const fmt = (s: number) =>
-    `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
   const live = phase.kind === "countdown" || phase.kind === "recording";
+  const showLyrics = phase.kind === "setup" || phase.kind === "loading" || live;
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-black">
-      {/* Camera preview (mirrored like a selfie) or the finished recording */}
-      <div className="relative min-h-0 flex-1 overflow-hidden">
-        {phase.kind === "done" ? (
-          // The key makes React build a fresh element. Reusing the camera's
-          // element kept its live stream attached, which browsers show as a
-          // "Live Broadcast" instead of your recording.
-          <video
-            key="playback"
-            src={phase.url}
-            controls
-            playsInline
-            onLoadedMetadata={fixUnknownDuration}
-            className="h-full w-full object-contain"
-          />
-        ) : (
-          <>
+    <div className="fixed inset-0 z-50 flex flex-col bg-black text-white">
+      {/* The stage: a 9:16 frame, exactly what the video will look like. */}
+      <div className="relative flex min-h-0 flex-1 items-center justify-center">
+        <div className="relative aspect-[9/16] h-full max-h-full max-w-full overflow-hidden bg-neutral-900 sm:rounded-3xl sm:my-3 sm:h-[calc(100%-1.5rem)]">
+          {phase.kind === "done" ? (
+            // A fresh element: reusing the camera's kept its live stream
+            // attached, which browsers show as a "Live Broadcast".
             <video
-              key="camera"
-              ref={(el) => {
-                videoRef.current = el;
-                if (el && camRef.current && el.srcObject !== camRef.current)
-                  el.srcObject = camRef.current;
-              }}
-              autoPlay
-              muted
+              key="playback"
+              src={phase.url}
+              controls
               playsInline
-              className="h-full w-full -scale-x-100 object-cover"
+              autoPlay
+              onLoadedMetadata={fixUnknownDuration}
+              className="h-full w-full bg-black object-contain"
             />
-            {/* Processed picture (blur / background) drawn over the camera */}
-            <canvas
-              key="fx"
-              ref={fxCanvasRef}
-              className={`absolute inset-0 h-full w-full -scale-x-100 object-cover ${
-                bg.kind !== "none" && fxReady && !fxError ? "" : "hidden"
-              }`}
-            />
-            {bg.kind !== "none" && !fxReady && !fxError && (
-              <div className="absolute left-1/2 top-16 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 text-xs">
-                Loading background…
+          ) : (
+            <>
+              {/* Camera feed: the source for the canvas. Kept rendered (not
+                  display:none) so every browser keeps decoding it. */}
+              <video
+                key="camera"
+                ref={(el) => {
+                  videoRef.current = el;
+                  if (el && camRef.current && el.srcObject !== camRef.current)
+                    el.srcObject = camRef.current;
+                }}
+                autoPlay
+                muted
+                playsInline
+                className={
+                  rawCamera
+                    ? "absolute inset-0 h-full w-full -scale-x-100 object-cover"
+                    : "pointer-events-none absolute top-0 left-0 h-px w-px opacity-0"
+                }
+              />
+              {/* Mirrored like a selfie camera; the video itself isn't. */}
+              <canvas
+                ref={canvasRef}
+                className={`absolute inset-0 h-full w-full -scale-x-100 object-contain ${rawCamera ? "hidden" : ""}`}
+              />
+            </>
+          )}
+
+          {phase.kind === "finishing" && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-black/80 px-10 text-center">
+              <div className="h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-pink-500" />
+              <p className="font-medium">Preparing your video…</p>
+              <div className="h-1.5 w-full max-w-48 overflow-hidden rounded-full bg-white/15">
+                <div
+                  className="h-full bg-pink-500 transition-[width]"
+                  style={{ width: `${Math.round(phase.progress * 100)}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Top bar */}
+          <div className="absolute inset-x-0 top-0 flex items-center gap-3 bg-gradient-to-b from-black/60 to-transparent p-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
+            <button
+              aria-label="Close"
+              onClick={() => {
+                cleanup();
+                onClose();
+              }}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-black/40 text-lg backdrop-blur-md"
+            >
+              ✕
+            </button>
+            <span className="min-w-0 flex-1 truncate text-center text-sm font-semibold [text-shadow:0_1px_4px_#000]">
+              {song.title}
+            </span>
+            {phase.kind === "recording" ? (
+              <span className="flex shrink-0 items-center gap-1.5 rounded-full bg-red-600/90 px-3 py-1.5 text-xs font-semibold tabular-nums">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
+                {fmt(elapsed)}
+                {duration ? (
+                  <span className="text-white/70">/ {fmt(duration)}</span>
+                ) : null}
+              </span>
+            ) : (
+              <span className="w-9 shrink-0" />
+            )}
+          </div>
+
+          {/* Background status, so it never fails silently */}
+          {cameraOn &&
+            (fxStatus.kind === "loading" ||
+              fxStatus.kind === "error" ||
+              rawCamera) && (
+              <div className="absolute inset-x-0 top-16 flex justify-center px-4">
+                <span
+                  className={`rounded-full px-3 py-1.5 text-center text-xs backdrop-blur-md ${
+                    fxStatus.kind === "loading" && !rawCamera
+                      ? "bg-black/50"
+                      : "bg-red-600/80"
+                  }`}
+                >
+                  {rawCamera
+                    ? "Backgrounds aren't working on this browser; using the plain camera."
+                    : fxStatus.kind === "loading"
+                      ? "Getting your background ready…"
+                      : fxStatus.kind === "error"
+                        ? fxStatus.message
+                        : ""}
+                </span>
               </div>
             )}
-          </>
-        )}
 
-        <div className="absolute inset-x-0 top-0 flex items-center justify-between bg-gradient-to-b from-black/70 to-transparent p-4">
-          <button
-            onClick={() => {
-              cleanup();
-              onClose();
-            }}
-            className="rounded-full bg-black/50 px-3 py-1.5 text-sm"
-          >
-            ✕ Close
-          </button>
-          <span className="truncate px-2 text-sm font-medium">
-            {song.title}
-          </span>
-          {phase.kind === "recording" ? (
-            <span className="flex items-center gap-1.5 rounded-full bg-red-600 px-3 py-1.5 text-sm font-semibold">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
-              {fmt(elapsed)} / {fmt(duration)}
-            </span>
-          ) : (
-            <span className="w-16" />
+          {phase.kind === "countdown" && (
+            <div className="absolute inset-0 flex items-center justify-center">
+              <span
+                key={phase.n}
+                className="text-9xl font-bold [text-shadow:0_2px_20px_#000]"
+              >
+                {phase.n}
+              </span>
+            </div>
           )}
-        </div>
 
-        {phase.kind === "countdown" && (
-          <div className="absolute inset-0 flex items-center justify-center text-8xl font-bold">
-            {phase.n}
+          {/* Lyrics over the picture (not burned into the video) */}
+          {showLyrics && song.timed?.length ? (
+            <div className="absolute inset-x-0 bottom-0 h-[45%] bg-gradient-to-t from-black/80 via-black/40 to-transparent">
+              <TimedLyrics
+                lines={song.timed}
+                time={phase.kind === "recording" ? elapsed : 0}
+              />
+            </div>
+          ) : null}
+          {showLyrics && song.lyrics && !song.timed?.length ? (
+            <div className="absolute inset-x-0 bottom-0 max-h-[45%] overflow-y-auto bg-gradient-to-t from-black/80 via-black/50 to-transparent px-5 pt-10 pb-4">
+              <p className="text-center text-lg leading-relaxed font-semibold whitespace-pre-line [text-shadow:0_1px_4px_#000]">
+                {song.lyrics}
+              </p>
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      {/* Controls: one row, nothing else */}
+      <div className="flex min-h-28 items-center justify-center px-6 pt-3 pb-[max(1.25rem,env(safe-area-inset-bottom))]">
+        {phase.kind === "setup" && (
+          <div className="flex w-full max-w-sm items-center justify-between">
+            <RoundButton label="Background" onClick={() => setSheet("bg")}>
+              <BgIcon />
+            </RoundButton>
+            <button
+              aria-label="Start recording"
+              onClick={start}
+              className="group flex h-20 w-20 items-center justify-center rounded-full ring-4 ring-white/90 transition active:scale-95"
+            >
+              <span className="h-16 w-16 rounded-full bg-red-600 transition group-hover:bg-red-500" />
+            </button>
+            <RoundButton label="Sound" onClick={() => setSheet("sound")}>
+              <SoundIcon />
+            </RoundButton>
           </div>
         )}
-
-        {/* Lyrics over the camera (not burned into the video): highlighted
-            line by line when timings exist, otherwise static text. */}
-        {song.timed?.length && phase.kind !== "done" ? (
-          <div className="absolute inset-x-0 bottom-0 h-[55%] bg-gradient-to-t from-black/85 via-black/50 to-transparent">
-            <TimedLyrics
-              lines={song.timed}
-              time={phase.kind === "recording" ? elapsed : 0}
-            />
+        {(phase.kind === "loading" || phase.kind === "countdown") && (
+          <p className="text-sm text-white/70">
+            {phase.kind === "loading" ? "Loading the song…" : "Get ready…"}
+          </p>
+        )}
+        {phase.kind === "recording" && (
+          <button
+            aria-label="Stop recording"
+            onClick={stopEarly}
+            className="flex h-20 w-20 items-center justify-center rounded-full ring-4 ring-white/90 transition active:scale-95"
+          >
+            <span className="h-8 w-8 rounded-md bg-red-600" />
+          </button>
+        )}
+        {phase.kind === "finishing" && (
+          <p className="text-sm text-white/60">Almost there</p>
+        )}
+        {phase.kind === "done" && (
+          <div className="grid w-full max-w-sm grid-cols-3 gap-3">
+            <ActionButton onClick={again} icon="↺" label="Retake" />
+            <a
+              href={phase.url}
+              download={fileName(phase.ext)}
+              className="flex flex-col items-center gap-1 rounded-2xl bg-white/10 py-3 text-sm font-medium hover:bg-white/15"
+            >
+              <span className="text-xl">⬇</span>
+              Save
+            </a>
+            {canShareFile(phase.blob, phase.ext) ? (
+              <ActionButton
+                primary
+                onClick={() => share(phase.blob, phase.ext)}
+                icon="↗"
+                label="Share"
+              />
+            ) : (
+              <a
+                href={phase.url}
+                download={fileName(phase.ext)}
+                className="flex flex-col items-center gap-1 rounded-2xl bg-pink-600 py-3 text-sm font-semibold hover:bg-pink-500"
+              >
+                <span className="text-xl">↗</span>
+                Save to share
+              </a>
+            )}
           </div>
-        ) : null}
-        {song.lyrics && !song.timed?.length && phase.kind !== "done" && (
-          <div className="absolute inset-x-0 bottom-0 max-h-[55%] overflow-y-auto bg-gradient-to-t from-black/85 via-black/60 to-transparent px-5 pb-4 pt-10">
-            <p className="whitespace-pre-line text-center text-xl leading-relaxed font-semibold [text-shadow:0_1px_4px_#000]">
-              {song.lyrics}
-            </p>
+        )}
+        {phase.kind === "error" && (
+          <div className="w-full max-w-sm space-y-3 text-center">
+            <p className="text-sm text-red-300">{phase.message}</p>
+            <button
+              onClick={again}
+              className="w-full rounded-2xl bg-white/10 py-3 font-semibold"
+            >
+              Try again
+            </button>
           </div>
         )}
       </div>
 
-      {/* Controls */}
-      <div className="space-y-3 bg-neutral-950 p-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
-        {phase.kind === "error" && (
-          <p className="text-sm text-red-400">{phase.message}</p>
-        )}
+      {/* Pop-up panels */}
+      {sheet && (
+        <div
+          className="absolute inset-0 z-10 flex items-end justify-center bg-black/40"
+          onClick={() => setSheet(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-t-3xl bg-neutral-900/95 p-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] ring-1 ring-white/10 backdrop-blur-xl sm:mb-6 sm:rounded-3xl"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-base font-semibold">
+                {sheet === "bg" ? "Background" : "Sound"}
+              </h2>
+              <button
+                onClick={() => setSheet(null)}
+                className="rounded-full bg-white/10 px-3 py-1 text-sm"
+              >
+                Done
+              </button>
+            </div>
 
-        {(phase.kind === "setup" || live || phase.kind === "loading") && (
-          <>
-            <Slider label="🎵 Music" value={music} onChange={setMusic} />
-            <Slider
-              label="🎤 Voice"
-              value={voice}
-              onChange={setVoice}
-              max={2}
-            />
-            {studio && (
-              <Slider label="✨ Reverb" value={reverb} onChange={setReverb} />
-            )}
-          </>
-        )}
-
-        {phase.kind === "setup" && (
-          <>
-            <div className="-mx-4 flex gap-2 overflow-x-auto px-4 pb-1 [scrollbar-width:none]">
-              {(
-                [
-                  {
-                    key: "none",
-                    label: "None",
-                    c: { kind: "none" },
-                    style: { background: "#262626" },
-                  },
-                  {
-                    key: "blur",
-                    label: "Blur",
-                    c: { kind: "blur", strength: "light" },
-                    style: {
-                      background: "linear-gradient(135deg,#555,#999,#444)",
-                      filter: "blur(1px)",
-                    },
-                  },
-                  {
-                    key: "blur2",
-                    label: "More blur",
-                    c: { kind: "blur", strength: "strong" },
-                    style: {
-                      background: "linear-gradient(135deg,#777,#aaa)",
-                      filter: "blur(2px)",
-                    },
-                  },
-                  ...BUILTINS.map((b) => ({
-                    key: b.id,
-                    label: b.label,
-                    c: { kind: "builtin", id: b.id } as BackgroundChoice,
-                    style: {
-                      backgroundImage: `url(${thumbs[b.id]})`,
-                      backgroundSize: "cover",
-                    },
-                  })),
-                ] as {
-                  key: string;
-                  label: string;
-                  c: BackgroundChoice;
-                  style: React.CSSProperties;
-                }[]
-              ).map((o) => {
-                const selected = JSON.stringify(o.c) === JSON.stringify(bg);
-                return (
-                  <button
-                    key={o.key}
-                    onClick={() => chooseBg(o.c)}
-                    className={`flex shrink-0 flex-col items-center gap-1 text-[11px] ${selected ? "text-white" : "text-white/60"}`}
+            {sheet === "bg" && (
+              <>
+                <div className="grid grid-cols-5 gap-2.5">
+                  {BG_OPTIONS.map((o) => {
+                    const selected = JSON.stringify(o.c) === JSON.stringify(bg);
+                    const style: React.CSSProperties =
+                      o.c.kind === "builtin"
+                        ? {
+                            backgroundImage: `url(${thumbs[o.c.id]})`,
+                            backgroundSize: "cover",
+                          }
+                        : o.c.kind === "blur"
+                          ? {
+                              background:
+                                "radial-gradient(circle at 50% 40%, #d4d4d8 0 22%, transparent 23%), linear-gradient(135deg,#52525b,#a1a1aa,#3f3f46)",
+                              filter:
+                                o.c.strength === "strong"
+                                  ? "blur(2px)"
+                                  : "blur(1px)",
+                            }
+                          : { background: "#27272a" };
+                    return (
+                      <button
+                        key={o.key}
+                        onClick={() => chooseBg(o.c)}
+                        className={`flex flex-col items-center gap-1.5 text-[11px] ${selected ? "text-white" : "text-white/55"}`}
+                      >
+                        <span
+                          style={style}
+                          className={`flex aspect-[9/16] w-full items-center justify-center rounded-xl text-base ring-2 transition ${
+                            selected ? "ring-pink-500" : "ring-white/10"
+                          }`}
+                        >
+                          {o.c.kind === "none" ? "⊘" : ""}
+                        </span>
+                        {o.label}
+                      </button>
+                    );
+                  })}
+                  <label
+                    className={`flex cursor-pointer flex-col items-center gap-1.5 text-[11px] ${bg.kind === "custom" ? "text-white" : "text-white/55"}`}
                   >
                     <span
-                      style={o.style}
-                      className={`block h-12 w-9 rounded-lg ring-2 ${selected ? "ring-pink-500" : "ring-white/10"}`}
+                      style={
+                        customUrl
+                          ? {
+                              backgroundImage: `url(${customUrl})`,
+                              backgroundSize: "cover",
+                            }
+                          : undefined
+                      }
+                      className={`flex aspect-[9/16] w-full items-center justify-center rounded-xl bg-white/10 text-xl ring-2 ${
+                        bg.kind === "custom" ? "ring-pink-500" : "ring-white/10"
+                      }`}
+                    >
+                      {customUrl ? "" : "+"}
+                    </span>
+                    Your photo
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = "";
+                        if (!file) return;
+                        setCustomUrl(await saveCustomImage(file));
+                        chooseBg({ kind: "custom" });
+                      }}
                     />
-                    {o.label}
-                  </button>
-                );
-              })}
-              <label
-                className={`flex shrink-0 cursor-pointer flex-col items-center gap-1 text-[11px] ${bg.kind === "custom" ? "text-white" : "text-white/60"}`}
-              >
-                <span
-                  style={
-                    customUrl
-                      ? {
-                          backgroundImage: `url(${customUrl})`,
-                          backgroundSize: "cover",
-                        }
-                      : undefined
+                  </label>
+                </div>
+                <p className="mt-4 text-center text-xs text-white/50">
+                  {fxStatus.kind === "loading"
+                    ? "Getting your background ready…"
+                    : fxStatus.kind === "error"
+                      ? fxStatus.message
+                      : "What you see is exactly what gets recorded."}
+                </p>
+              </>
+            )}
+
+            {sheet === "sound" && (
+              <div className="space-y-4">
+                <Slider label="Music" value={music} onChange={setMusic} />
+                <Slider
+                  label="Voice"
+                  value={voice}
+                  onChange={setVoice}
+                  max={2}
+                />
+                {studio && (
+                  <Slider label="Reverb" value={reverb} onChange={setReverb} />
+                )}
+                <Toggle
+                  label="Studio voice"
+                  hint="Clarity, smooth levels and reverb"
+                  checked={studio}
+                  onChange={setStudio}
+                />
+                <Toggle
+                  label="Wearing headphones"
+                  hint={
+                    headphones
+                      ? "Best sound: the mic hears only you"
+                      : "Speaker mode: echo cancelling removes the music"
                   }
-                  className={`flex h-12 w-9 items-center justify-center rounded-lg bg-white/10 text-lg ring-2 ${bg.kind === "custom" ? "ring-pink-500" : "ring-white/10"}`}
-                >
-                  {customUrl ? "" : "+"}
-                </span>
-                Your photo
-                <input
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={async (e) => {
-                    const file = e.target.files?.[0];
-                    e.target.value = "";
-                    if (!file) return;
-                    setCustomUrl(await saveCustomImage(file));
-                    chooseBg({ kind: "custom" });
+                  checked={headphones}
+                  onChange={(hp) => {
+                    setHeadphones(hp);
+                    try {
+                      localStorage.setItem(
+                        "song-recorder:headphones",
+                        hp ? "yes" : "no",
+                      );
+                    } catch {}
+                    stopCamera();
+                    startCamera(undefined, micId, hp);
                   }}
                 />
-              </label>
-            </div>
-            {fxError && <p className="text-xs text-red-400">{fxError}</p>}
-
-            <details className="rounded-xl bg-white/5 px-3 py-2 text-sm">
-              <summary className="cursor-pointer select-none text-white/80">
-                ⚙️ Sound settings
-              </summary>
-              <div className="mt-3 space-y-3">
-                <label className="flex items-center justify-between gap-3 text-sm">
-                  <span>
-                    🎙️ Studio voice
-                    <span className="block text-xs text-white/50">
-                      EQ, compression and reverb, like a studio mix
-                    </span>
-                  </span>
-                  <input
-                    type="checkbox"
-                    checked={studio}
-                    onChange={(e) => setStudio(e.target.checked)}
-                    className="h-5 w-5 accent-pink-500"
-                  />
-                </label>
-                <label className="flex items-center justify-between gap-3 text-sm">
-                  <span>
-                    🎧 Wearing headphones
-                    <span className="block text-xs text-white/50">
-                      {headphones
-                        ? "Best sound: the mic hears only your voice"
-                        : "Speaker mode: echo cancelling removes the music from the mic"}
-                    </span>
-                  </span>
-                  <input
-                    type="checkbox"
-                    checked={headphones}
-                    onChange={(e) => {
-                      const hp = e.target.checked;
-                      setHeadphones(hp);
-                      try {
-                        localStorage.setItem(
-                          "song-recorder:headphones",
-                          hp ? "yes" : "no",
-                        );
-                      } catch {}
-                      stopCamera();
-                      startCamera(undefined, micId, hp);
-                    }}
-                    className="h-5 w-5 accent-pink-500"
-                  />
-                </label>
                 {mics.length > 1 && (
                   <label className="flex items-center gap-3 text-sm">
-                    <span className="w-20 shrink-0">🎤 Mic</span>
+                    <span className="w-16 shrink-0 text-white/80">Mic</span>
                     <select
                       value={micId || cam0MicId()}
                       onChange={(e) => {
@@ -617,7 +773,7 @@ export default function Recorder({
                         stopCamera();
                         startCamera(undefined, e.target.value, headphones);
                       }}
-                      className="min-w-0 flex-1 rounded-lg bg-white/10 px-2 py-1.5"
+                      className="min-w-0 flex-1 rounded-xl bg-white/10 px-3 py-2"
                     >
                       {mics.map((m, i) => (
                         <option
@@ -631,52 +787,156 @@ export default function Recorder({
                     </select>
                   </label>
                 )}
-                <p className="text-center text-xs text-white/50">
+                <p className="text-center text-xs leading-relaxed text-white/45">
                   {headphones
-                    ? "Wired headphones sound best. Bluetooth headphones switch the phone to a low-quality call mic; if you use them, pick the phone's own mic above."
-                    : "Keep the music volume moderate and hold the phone 20–30 cm away. Headphones still give the clearest voice."}
+                    ? "Wired headphones sound best. Bluetooth ones switch the phone to a low-quality call mic."
+                    : "Keep the music moderate and the phone 20–30 cm away."}
                 </p>
               </div>
-            </details>
-            <button
-              onClick={start}
-              disabled={bg.kind !== "none" && !fxReady && !fxError}
-              className="w-full rounded-xl bg-red-600 py-3.5 text-base font-semibold disabled:opacity-50"
-            >
-              ● Start recording
-            </button>
-          </>
-        )}
-        {phase.kind === "loading" && (
-          <p className="text-center text-sm text-white/70">Loading the song…</p>
-        )}
-        {phase.kind === "recording" && (
-          <button
-            onClick={stopEarly}
-            className="w-full rounded-xl bg-white/15 py-3.5 text-base font-semibold"
-          >
-            ■ Stop
-          </button>
-        )}
-        {phase.kind === "done" && (
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              onClick={again}
-              className="rounded-xl bg-white/15 py-3.5 font-semibold"
-            >
-              ↺ Record again
-            </button>
-            <a
-              href={phase.url}
-              download={`${song.title}.${phase.ext}`}
-              className="rounded-xl bg-pink-600 py-3.5 text-center font-semibold"
-            >
-              ⬇ Save video
-            </a>
+            )}
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+function RoundButton({
+  label,
+  onClick,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex w-20 flex-col items-center gap-1.5 text-xs text-white/75"
+    >
+      <span className="flex h-12 w-12 items-center justify-center rounded-full bg-white/10 ring-1 ring-white/15 transition hover:bg-white/15 active:scale-95">
+        {children}
+      </span>
+      {label}
+    </button>
+  );
+}
+
+function ActionButton({
+  icon,
+  label,
+  onClick,
+  primary,
+}: {
+  icon: string;
+  label: string;
+  onClick: () => void;
+  primary?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex flex-col items-center gap-1 rounded-2xl py-3 text-sm font-medium ${
+        primary
+          ? "bg-pink-600 font-semibold hover:bg-pink-500"
+          : "bg-white/10 hover:bg-white/15"
+      }`}
+    >
+      <span className="text-xl">{icon}</span>
+      {label}
+    </button>
+  );
+}
+
+function BgIcon() {
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+    >
+      <rect x="3" y="3" width="18" height="18" rx="4" />
+      <circle cx="12" cy="10" r="3" />
+      <path d="M6.5 21c.8-3 3-4.5 5.5-4.5s4.7 1.5 5.5 4.5" />
+    </svg>
+  );
+}
+
+function SoundIcon() {
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+    >
+      <path d="M5 4v16M12 4v16M19 4v16" />
+      <circle cx="5" cy="14" r="2" fill="currentColor" />
+      <circle cx="12" cy="8" r="2" fill="currentColor" />
+      <circle cx="19" cy="15" r="2" fill="currentColor" />
+    </svg>
+  );
+}
+
+function Toggle({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-center justify-between gap-3 text-sm">
+      <span>
+        {label}
+        <span className="block text-xs text-white/45">{hint}</span>
+      </span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="peer sr-only"
+      />
+      <span className="relative h-7 w-12 shrink-0 rounded-full bg-white/15 transition peer-checked:bg-pink-600 after:absolute after:top-1 after:left-1 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition peer-checked:after:translate-x-5" />
+    </label>
+  );
+}
+
+function Slider({
+  label,
+  value,
+  onChange,
+  max = 1,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  max?: number;
+}) {
+  return (
+    <label className="flex items-center gap-3 text-sm">
+      <span className="w-16 shrink-0 text-white/80">{label}</span>
+      <input
+        type="range"
+        min={0}
+        max={max}
+        step={0.05}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="flex-1 accent-pink-500"
+      />
+    </label>
   );
 }
 
@@ -693,31 +953,4 @@ function fixUnknownDuration(e: React.SyntheticEvent<HTMLVideoElement>) {
   };
   v.addEventListener("durationchange", rewind);
   v.currentTime = 1e101;
-}
-
-function Slider({
-  label,
-  value,
-  onChange,
-  max = 1,
-}: {
-  label: string;
-  value: number;
-  onChange: (v: number) => void;
-  max?: number;
-}) {
-  return (
-    <label className="flex items-center gap-3 text-sm">
-      <span className="w-20 shrink-0">{label}</span>
-      <input
-        type="range"
-        min={0}
-        max={max}
-        step={0.05}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        className="flex-1 accent-pink-500"
-      />
-    </label>
-  );
 }

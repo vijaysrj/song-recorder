@@ -26,15 +26,27 @@ const AUDIO_TYPES: Record<string, string> = {
 };
 // Listing extensions as well as audio/* makes Android open the full file
 // browser (Downloads, WhatsApp, Drive) instead of just the music library.
-const ACCEPT = "audio/*,video/mp4," + Object.keys(AUDIO_TYPES).map((e) => "." + e).join(",");
+const ACCEPT =
+  "audio/*,video/mp4," +
+  Object.keys(AUDIO_TYPES)
+    .map((e) => "." + e)
+    .join(",");
 
 function contentTypeFor(file: File) {
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
-  if (file.type.startsWith("audio/") || file.type === "video/mp4") return file.type;
+  if (file.type.startsWith("audio/") || file.type === "video/mp4")
+    return file.type;
   return AUDIO_TYPES[ext] ?? "audio/mpeg";
 }
 
-export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
+export default function AddSong({
+  onAdded,
+  startOpen = false,
+}: {
+  onAdded: (s: Song) => void;
+  startOpen?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(startOpen);
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
   const [isKaraoke, setIsKaraoke] = useState(false);
@@ -49,7 +61,8 @@ export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
         access: "public",
         contentType: contentTypeFor(file),
         handleUploadUrl: "/api/upload",
-        onUploadProgress: (e) => setPhase({ kind: "uploading", pct: Math.round(e.percentage) }),
+        onUploadProgress: (e) =>
+          setPhase({ kind: "uploading", pct: Math.round(e.percentage) }),
       });
 
       let trackUrl = blob.url;
@@ -60,18 +73,23 @@ export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
           body: JSON.stringify({ url: blob.url }),
         });
         const job = await res.json();
-        if (!res.ok) throw new Error(job.error ?? "Could not start vocal removal");
+        if (!res.ok)
+          throw new Error(job.error ?? "Could not start vocal removal");
 
         const startedAt = Date.now();
         for (;;) {
-          setPhase({ kind: "separating", seconds: Math.round((Date.now() - startedAt) / 1000) });
+          setPhase({
+            kind: "separating",
+            seconds: Math.round((Date.now() - startedAt) / 1000),
+          });
           await sleep(4000);
           const s = await (await fetch(`/api/separate/${job.id}`)).json();
           if (s.status === "done") {
             trackUrl = s.url;
             break;
           }
-          if (s.status === "failed") throw new Error(s.error ?? "Vocal removal failed");
+          if (s.status === "failed")
+            throw new Error(s.error ?? "Vocal removal failed");
         }
       }
 
@@ -86,14 +104,36 @@ export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
       setTitle("");
       setIsKaraoke(false);
       setPhase({ kind: "idle" });
+      setExpanded(false);
     } catch (e) {
       setPhase({ kind: "error", message: (e as Error).message });
     }
   }
 
+  if (!expanded && !busy) {
+    return (
+      <button
+        onClick={() => setExpanded(true)}
+        className="flex w-full items-center justify-center gap-2 rounded-2xl border border-dashed border-white/20 py-4 text-sm font-medium text-white/75 hover:bg-white/[0.03]"
+      >
+        <span className="text-lg leading-none">＋</span> Add a song
+      </button>
+    );
+  }
+
   return (
-    <section className="rounded-2xl bg-white/5 p-4 ring-1 ring-white/10">
-      <h2 className="mb-3 text-lg font-semibold">Add a song</h2>
+    <section className="rounded-2xl bg-white/[0.05] p-4 ring-1 ring-white/10">
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className="text-base font-semibold">Add a song</h2>
+        {!busy && (
+          <button
+            onClick={() => setExpanded(false)}
+            className="text-sm text-white/50"
+          >
+            Cancel
+          </button>
+        )}
+      </div>
 
       <label className="block rounded-xl border-2 border-dashed border-white/20 p-5 text-center active:bg-white/5">
         <input
@@ -110,7 +150,9 @@ export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
         {file ? (
           <span className="break-all">{file.name}</span>
         ) : (
-          <span className="text-white/60">Tap to choose a song (MP3 or M4A)</span>
+          <span className="text-white/60">
+            Tap to choose a song (MP3 or M4A)
+          </span>
         )}
       </label>
 
@@ -146,11 +188,14 @@ export default function AddSong({ onAdded }: { onAdded: (s: Song) => void }) {
       )}
       {phase.kind === "separating" && (
         <p className="mt-3 text-sm text-white/70">
-          Removing vocals… {phase.seconds}s (usually 1 to 3 minutes, keep this page open)
+          Removing vocals… {phase.seconds}s (usually 1 to 3 minutes, keep this
+          page open)
         </p>
       )}
       {phase.kind === "error" && (
-        <p className="mt-3 text-sm text-red-400">Something went wrong: {phase.message}</p>
+        <p className="mt-3 text-sm text-red-400">
+          Something went wrong: {phase.message}
+        </p>
       )}
     </section>
   );
