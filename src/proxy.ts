@@ -4,6 +4,9 @@ import { readSession, SESSION_COOKIE } from "@/lib/auth";
 // Everything except the sign-in page, the sign-in routes and static files
 // needs a valid Google session for an allowed account.
 export async function proxy(request: NextRequest) {
+  // Until the Google keys are added, Vercel's own login guards the app.
+  if (!process.env.GOOGLE_CLIENT_ID) return NextResponse.next();
+
   const email = await readSession(request.cookies.get(SESSION_COOKIE)?.value);
   if (email) return NextResponse.next();
 

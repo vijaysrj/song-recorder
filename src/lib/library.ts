@@ -3,8 +3,12 @@ export type Song = {
   title: string;
   trackUrl: string; // karaoke (no vocals) track
   lyrics: string;
+  // Optional start time (seconds into the track) for each lyric line.
+  timed?: TimedLine[];
   createdAt: number;
 };
+
+export type TimedLine = { t: number; text: string };
 
 const KEY = "song-recorder:library";
 

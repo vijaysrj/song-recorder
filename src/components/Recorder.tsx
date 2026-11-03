@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Song } from "@/lib/library";
+import TimedLyrics from "./TimedLyrics";
 
 type Phase =
   | { kind: "setup" }
@@ -189,7 +190,7 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
       src.start();
       const startedAt = ctx.currentTime;
       setPhase({ kind: "recording" });
-      const timer = setInterval(() => setElapsed(ctx.currentTime - startedAt), 250);
+      const timer = setInterval(() => setElapsed(ctx.currentTime - startedAt), 100);
       // Stop shortly after the song ends, once the delayed tail is captured.
       src.onended = async () => {
         clearInterval(timer);
@@ -281,8 +282,14 @@ export default function Recorder({ song, onClose }: { song: Song; onClose: () =>
           </div>
         )}
 
-        {/* Static lyrics over the camera. Not burned into the video. */}
-        {song.lyrics && phase.kind !== "done" && (
+        {/* Lyrics over the camera (not burned into the video): highlighted
+            line by line when timings exist, otherwise static text. */}
+        {song.timed?.length && phase.kind !== "done" ? (
+          <div className="absolute inset-x-0 bottom-0 h-[55%] bg-gradient-to-t from-black/85 via-black/50 to-transparent">
+            <TimedLyrics lines={song.timed} time={phase.kind === "recording" ? elapsed : 0} />
+          </div>
+        ) : null}
+        {song.lyrics && !song.timed?.length && phase.kind !== "done" && (
           <div className="absolute inset-x-0 bottom-0 max-h-[55%] overflow-y-auto bg-gradient-to-t from-black/85 via-black/60 to-transparent px-5 pb-4 pt-10">
             <p className="whitespace-pre-line text-center text-xl leading-relaxed font-semibold [text-shadow:0_1px_4px_#000]">
               {song.lyrics}
