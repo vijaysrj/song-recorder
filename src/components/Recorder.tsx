@@ -745,6 +745,7 @@ export default function Recorder({
         {phase.kind === "done" && editing && (
           <VideoEditor
             blob={phase.blob}
+            title={song.title}
             onCancel={() => setEditing(false)}
             onSave={(edited) => {
               setEditing(false);

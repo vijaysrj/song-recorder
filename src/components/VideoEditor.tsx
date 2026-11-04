@@ -3,10 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import {
   exportEdit,
+  inRanges,
   keptRanges,
   type Range,
   videoDuration,
 } from "@/lib/editVideo";
+import { audioLevels, drawInterlude } from "@/lib/interlude";
 
 const fmt = (s: number) => {
   const m = Math.floor(s / 60);
@@ -14,18 +16,27 @@ const fmt = (s: number) => {
   return `${m}:${sec.toFixed(1).padStart(4, "0")}`;
 };
 
-// Trim the start and end of your video and cut out parts in the middle.
-// The preview plays the edit as it will be saved (skipping cut parts).
+type Mark = "cut" | "hide";
+
+// Trim the start and end of your video, cut out parts in the middle, and
+// hide the camera in parts (like an interlude) to show a music animation.
+// The preview plays the edit as it will be saved.
 export default function VideoEditor({
   blob,
+  title,
   onSave,
   onCancel,
 }: {
   blob: Blob;
+  title: string;
   onSave: (edited: Blob) => void;
   onCancel: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const animRef = useRef<HTMLCanvasElement>(null);
+  const levelsRef = useRef<Float32Array | null>(null);
+  const [hidden, setHidden] = useState<Range[]>([]);
+  const [markKind, setMarkKind] = useState<Mark>("cut");
   const [duration, setDuration] = useState(0);
   const [trim, setTrim] = useState<Range>({ start: 0, end: 0 });
   const [cuts, setCuts] = useState<Range[]>([]);
@@ -56,6 +67,45 @@ export default function VideoEditor({
       off = true;
     };
   }, [blob]);
+
+  // Loudness of the sound, so the animation can move with the music.
+  useEffect(() => {
+    let off = false;
+    audioLevels(blob)
+      .then((l) => {
+        if (!off) levelsRef.current = l;
+      })
+      .catch(() => {});
+    return () => {
+      off = true;
+    };
+  }, [blob]);
+
+  const hiding = inRanges(time, hidden);
+  // Draw the animation over the preview while in a hidden part.
+  useEffect(() => {
+    if (!hiding) return;
+    const v = videoRef.current;
+    const c = animRef.current;
+    const ctx = c?.getContext("2d");
+    if (!v || !c || !ctx) return;
+    c.width = v.videoWidth || 1080;
+    c.height = v.videoHeight || 1920;
+    let raf = 0;
+    const frame = () => {
+      drawInterlude(
+        ctx,
+        c.width,
+        c.height,
+        v.currentTime,
+        levelsRef.current,
+        title,
+      );
+      raf = requestAnimationFrame(frame);
+    };
+    frame();
+    return () => cancelAnimationFrame(raf);
+  }, [hiding, title]);
 
   const keep = duration ? keptRanges(trim, cuts) : [];
   const keptLength = keep.reduce((s, r) => s + r.end - r.start, 0);
@@ -98,14 +148,19 @@ export default function VideoEditor({
     } else v.pause();
   }
 
-  function markCut() {
+  function mark(kind: Mark) {
     if (cutStart === null) {
+      setMarkKind(kind);
       setCutStart(time);
       return;
     }
     const a = Math.min(cutStart, time);
     const b = Math.max(cutStart, time);
-    if (b - a > 0.1) setCuts([...cuts, { start: a, end: b }]);
+    if (b - a > 0.1) {
+      const r = { start: a, end: b };
+      if (markKind === "cut") setCuts([...cuts, r]);
+      else setHidden([...hidden, r].sort((x, y) => x.start - y.start));
+    }
     setCutStart(null);
   }
 
@@ -114,7 +169,11 @@ export default function VideoEditor({
     setSaving(0);
     videoRef.current?.pause();
     try {
-      const edited = await exportEdit(blob, keep, (p) => setSaving(p));
+      const edited = await exportEdit(blob, keep, (p) => setSaving(p), {
+        ranges: hidden,
+        levels: levelsRef.current ?? (await audioLevels(blob)),
+        title,
+      });
       onSave(edited);
     } catch (e) {
       setError(`Couldn't save the edit (${(e as Error).message})`);
@@ -154,6 +213,13 @@ export default function VideoEditor({
           onPause={() => setPlaying(false)}
           className="max-h-full max-w-full"
         />
+        {hiding && (
+          <canvas
+            ref={animRef}
+            onClick={togglePlay}
+            className="absolute inset-0 h-full w-full object-contain"
+          />
+        )}
         {!playing && saving === null && (
           <button
             aria-label="Play"
@@ -196,9 +262,16 @@ export default function VideoEditor({
               style={{ left: pct(c.start), width: pct(c.end - c.start) }}
             />
           ))}
+          {hidden.map((c, i) => (
+            <div
+              key={i}
+              className="absolute inset-y-0 bg-violet-500/70"
+              style={{ left: pct(c.start), width: pct(c.end - c.start) }}
+            />
+          ))}
           {cutStart !== null && (
             <div
-              className="absolute inset-y-0 bg-red-500/40"
+              className={`absolute inset-y-0 ${markKind === "cut" ? "bg-red-500/40" : "bg-violet-400/40"}`}
               style={{
                 left: pct(Math.min(cutStart, time)),
                 width: pct(Math.abs(time - cutStart)),
@@ -237,23 +310,38 @@ export default function VideoEditor({
         />
 
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            onClick={markCut}
-            className={`rounded-full px-4 py-2 text-sm font-semibold ${
-              cutStart === null ? "bg-white/10" : "bg-red-600"
-            }`}
-          >
-            {cutStart === null
-              ? "✂ Cut from here"
-              : `✂ …to here (from ${fmt(cutStart)})`}
-          </button>
-          {cutStart !== null && (
-            <button
-              onClick={() => setCutStart(null)}
-              className="text-sm text-white/60"
-            >
-              Cancel cut
-            </button>
+          {cutStart === null ? (
+            <>
+              <button
+                onClick={() => mark("cut")}
+                className="rounded-full bg-white/10 px-4 py-2 text-sm font-semibold"
+              >
+                ✂ Cut from here
+              </button>
+              <button
+                onClick={() => mark("hide")}
+                className="rounded-full bg-white/10 px-4 py-2 text-sm font-semibold"
+              >
+                ♪ Hide video from here
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => mark(markKind)}
+                className={`rounded-full px-4 py-2 text-sm font-semibold ${
+                  markKind === "cut" ? "bg-red-600" : "bg-violet-600"
+                }`}
+              >
+                {markKind === "cut" ? "✂" : "♪"} …to here (from {fmt(cutStart)})
+              </button>
+              <button
+                onClick={() => setCutStart(null)}
+                className="text-sm text-white/60"
+              >
+                Cancel
+              </button>
+            </>
           )}
           {cuts.map((c, i) => (
             <span
@@ -270,10 +358,26 @@ export default function VideoEditor({
               </button>
             </span>
           ))}
+          {hidden.map((c, i) => (
+            <span
+              key={`h${i}`}
+              className="flex items-center gap-1 rounded-full bg-violet-600/30 px-3 py-1.5 text-xs"
+            >
+              Animation {fmt(c.start)}–{fmt(c.end)}
+              <button
+                aria-label="Show my video here again"
+                onClick={() => setHidden(hidden.filter((_, j) => j !== i))}
+                className="px-1"
+              >
+                ✕
+              </button>
+            </span>
+          ))}
         </div>
         <p className="text-xs text-white/40">
-          Play or drag to a spot, tap “Cut from here”, move to where the part
-          ends, then tap again.
+          Play or tap the bar to reach a spot, tap “Cut from here” (removes it)
+          or “Hide video from here” (shows a music animation, e.g. for an
+          interlude), move to where the part ends, then tap again.
         </p>
         {error && <p className="text-sm text-red-300">{error}</p>}
       </div>
