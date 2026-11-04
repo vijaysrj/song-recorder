@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { Song } from "@/lib/library";
 import TimedLyrics from "./TimedLyrics";
+import VideoEditor from "./VideoEditor";
+import { currentLine } from "@/lib/lrc";
 import { buildVocalChain } from "@/lib/vocalChain";
 import { BackgroundFx, type FxStatus } from "@/lib/backgroundFx";
 import { toShareableMp4 } from "@/lib/finalizeVideo";
@@ -102,7 +104,25 @@ export default function Recorder({
   // Shape of the picture (width / height), from the camera.
   const [aspect, setAspect] = useState(9 / 16);
   const [camSize, setCamSize] = useState("");
-  const [sheet, setSheet] = useState<null | "bg" | "sound">(null);
+  const [sheet, setSheet] = useState<null | "bg" | "sound" | "part">(null);
+  // Which part of the song to sing (null = all of it), and the song's length.
+  const [part, setPart] = useState<{ start: number; end: number } | null>(null);
+  const [songLength, setSongLength] = useState(0);
+  useEffect(() => {
+    const a = new Audio();
+    a.preload = "metadata";
+    a.onloadedmetadata = () =>
+      Number.isFinite(a.duration) && setSongLength(a.duration);
+    a.src = song.trackUrl;
+    return () => {
+      a.removeAttribute("src");
+    };
+  }, [song.trackUrl]);
+  const partStart = part?.start ?? 0;
+  // Video editing: the editor is open, and the unedited recording (so an
+  // edit can always be redone from the original).
+  const [editing, setEditing] = useState(false);
+  const [original, setOriginal] = useState<Blob | null>(null);
   const [thumbs] = useState(() =>
     Object.fromEntries(
       BUILTINS.map((b) => [b.id, paintBuiltin(b.id, 72, 128).toDataURL()]),
@@ -303,7 +323,9 @@ export default function Recorder({
       const res = await fetch(song.trackUrl);
       if (!res.ok) throw new Error("Could not load the karaoke track");
       const buffer = await ctx.decodeAudioData(await res.arrayBuffer());
-      setDuration(buffer.duration);
+      const from = Math.min(part?.start ?? 0, buffer.duration - 1);
+      const to = Math.min(part?.end ?? buffer.duration, buffer.duration);
+      setDuration(to - from);
 
       // Audio graph:
       //   music -> musicGain -> speakers/headphones (what you hear)
@@ -384,6 +406,7 @@ export default function Recorder({
         } catch (e) {
           console.warn("MP4 conversion failed, keeping the original", e);
         }
+        setOriginal(blob);
         setPhase({
           kind: "done",
           url: URL.createObjectURL(blob),
@@ -401,7 +424,7 @@ export default function Recorder({
       }
 
       rec.start(1000);
-      src.start();
+      src.start(0, from, to - from);
       const startedAt = ctx.currentTime;
       setPhase({ kind: "recording" });
       const timer = setInterval(
@@ -429,6 +452,17 @@ export default function Recorder({
     try {
       musicRef.current?.stop(); // triggers onended, which stops the recorder
     } catch {}
+  }
+
+  // Show a (new or edited) video on the finished screen.
+  function showVideo(blob: Blob) {
+    if (phase.kind === "done") URL.revokeObjectURL(phase.url);
+    setPhase({
+      kind: "done",
+      url: URL.createObjectURL(blob),
+      ext: blob.type.includes("mp4") ? "mp4" : "webm",
+      blob,
+    });
   }
 
   function again() {
@@ -530,7 +564,7 @@ export default function Recorder({
           )}
 
           {/* Top bar */}
-          <div className="absolute inset-x-0 top-0 flex items-center gap-3 bg-gradient-to-b from-black/60 to-transparent p-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
+          <div className="absolute inset-x-0 top-0 z-10 flex items-center gap-3 bg-gradient-to-b from-black/60 to-transparent p-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
             <button
               aria-label="Close"
               onClick={() => {
@@ -562,7 +596,7 @@ export default function Recorder({
             (fxStatus.kind === "loading" ||
               fxStatus.kind === "error" ||
               rawCamera) && (
-              <div className="absolute inset-x-0 top-16 flex justify-center px-4">
+              <div className="absolute inset-x-0 bottom-14 flex justify-center px-4">
                 <span
                   className={`rounded-full px-3 py-1.5 text-center text-xs backdrop-blur-md ${
                     fxStatus.kind === "loading" && !rawCamera
@@ -592,17 +626,33 @@ export default function Recorder({
             </div>
           )}
 
+          {/* Which part of the song you'll sing */}
+          {phase.kind === "setup" && (
+            <div className="absolute inset-x-0 bottom-3 flex justify-center">
+              <button
+                onClick={() => setSheet("part")}
+                className="rounded-full bg-black/50 px-4 py-2 text-xs font-medium backdrop-blur-md"
+              >
+                ♪{" "}
+                {part
+                  ? `${fmt(part.start)} – ${fmt(part.end)}`
+                  : `Whole song${songLength ? ` · ${fmt(songLength)}` : ""}`}{" "}
+                ▾
+              </button>
+            </div>
+          )}
+
           {/* Lyrics over the picture (not burned into the video) */}
           {showLyrics && song.timed?.length ? (
-            <div className="absolute inset-x-0 bottom-0 h-[45%] bg-gradient-to-t from-black/80 via-black/40 to-transparent">
+            <div className="absolute inset-x-0 top-0 h-[42%] bg-gradient-to-b from-black/80 via-black/45 to-transparent pt-12">
               <TimedLyrics
                 lines={song.timed}
-                time={phase.kind === "recording" ? elapsed : 0}
+                time={partStart + (phase.kind === "recording" ? elapsed : 0)}
               />
             </div>
           ) : null}
           {showLyrics && song.lyrics && !song.timed?.length ? (
-            <div className="absolute inset-x-0 bottom-0 max-h-[45%] overflow-y-auto bg-gradient-to-t from-black/80 via-black/50 to-transparent px-5 pt-10 pb-4">
+            <div className="absolute inset-x-0 top-0 max-h-[42%] overflow-y-auto bg-gradient-to-b from-black/80 via-black/50 to-transparent px-5 pt-14 pb-8">
               <p className="text-center text-lg leading-relaxed font-semibold whitespace-pre-line [text-shadow:0_1px_4px_#000]">
                 {song.lyrics}
               </p>
@@ -648,34 +698,59 @@ export default function Recorder({
           <p className="text-sm text-white/60">Almost there</p>
         )}
         {phase.kind === "done" && (
-          <div className="grid w-full max-w-sm grid-cols-3 gap-3">
-            <ActionButton onClick={again} icon="↺" label="Retake" />
-            <a
-              href={phase.url}
-              download={fileName(phase.ext)}
-              className="flex flex-col items-center gap-1 rounded-2xl bg-white/10 py-3 text-sm font-medium hover:bg-white/15"
-            >
-              <span className="text-xl">⬇</span>
-              Save
-            </a>
-            {canShareFile(phase.blob, phase.ext) ? (
+          <div className="w-full max-w-sm space-y-2">
+            {original && phase.blob !== original && (
+              <button
+                onClick={() => showVideo(original)}
+                className="w-full text-center text-xs text-white/55"
+              >
+                Edited · Undo edits
+              </button>
+            )}
+            <div className="grid grid-cols-4 gap-2">
+              <ActionButton onClick={again} icon="↺" label="Retake" />
               <ActionButton
-                primary
-                onClick={() => share(phase.blob, phase.ext)}
-                icon="↗"
-                label="Share"
+                onClick={() => setEditing(true)}
+                icon="✂"
+                label="Edit"
               />
-            ) : (
               <a
                 href={phase.url}
                 download={fileName(phase.ext)}
-                className="flex flex-col items-center gap-1 rounded-2xl bg-pink-600 py-3 text-sm font-semibold hover:bg-pink-500"
+                className="flex flex-col items-center gap-1 rounded-2xl bg-white/10 py-3 text-sm font-medium hover:bg-white/15"
               >
-                <span className="text-xl">↗</span>
-                Save to share
+                <span className="text-xl">⬇</span>
+                Save
               </a>
-            )}
+              {canShareFile(phase.blob, phase.ext) ? (
+                <ActionButton
+                  primary
+                  onClick={() => share(phase.blob, phase.ext)}
+                  icon="↗"
+                  label="Share"
+                />
+              ) : (
+                <a
+                  href={phase.url}
+                  download={fileName(phase.ext)}
+                  className="flex flex-col items-center gap-1 rounded-2xl bg-pink-600 py-3 text-sm font-semibold hover:bg-pink-500"
+                >
+                  <span className="text-xl">↗</span>
+                  Save to share
+                </a>
+              )}
+            </div>
           </div>
+        )}
+        {phase.kind === "done" && editing && (
+          <VideoEditor
+            blob={phase.blob}
+            onCancel={() => setEditing(false)}
+            onSave={(edited) => {
+              setEditing(false);
+              showVideo(edited);
+            }}
+          />
         )}
         {phase.kind === "error" && (
           <div className="w-full max-w-sm space-y-3 text-center">
@@ -702,7 +777,11 @@ export default function Recorder({
           >
             <div className="mb-4 flex items-center justify-between">
               <h2 className="text-base font-semibold">
-                {sheet === "bg" ? "Background" : "Sound"}
+                {sheet === "bg"
+                  ? "Background"
+                  : sheet === "part"
+                    ? "Part of the song"
+                    : "Sound"}
               </h2>
               <button
                 onClick={() => setSheet(null)}
@@ -792,6 +871,20 @@ export default function Recorder({
                       : "What you see is exactly what gets recorded."}
                 </p>
               </>
+            )}
+
+            {sheet === "part" && (
+              <PartPicker
+                length={songLength}
+                part={part}
+                onChange={setPart}
+                lineAt={(t) =>
+                  song.timed?.length
+                    ? (song.timed[currentLine(song.timed, t + 0.25)]?.text ??
+                      "")
+                    : ""
+                }
+              />
             )}
 
             {sheet === "sound" && (
@@ -959,6 +1052,66 @@ function SoundIcon() {
   );
 }
 
+// Pick the part of the song to sing: start and end, with the lyric line at
+// each point so it's easy to find a verse.
+function PartPicker({
+  length,
+  part,
+  onChange,
+  lineAt,
+}: {
+  length: number;
+  part: { start: number; end: number } | null;
+  onChange: (p: { start: number; end: number } | null) => void;
+  lineAt: (t: number) => string;
+}) {
+  if (!length)
+    return <p className="text-sm text-white/60">Loading the song…</p>;
+  const start = part?.start ?? 0;
+  const end = part?.end ?? length;
+  const set = (s: number, e: number) =>
+    onChange(s <= 0.5 && e >= length - 0.5 ? null : { start: s, end: e });
+  return (
+    <div className="space-y-4">
+      <div className="space-y-1">
+        <Slider
+          label={`From ${fmt(start)}`}
+          value={start}
+          max={length}
+          step={1}
+          onChange={(v) => set(Math.min(v, end - 5), end)}
+        />
+        {lineAt(start) && (
+          <p className="pl-[5rem] text-xs text-white/45">“{lineAt(start)}”</p>
+        )}
+      </div>
+      <div className="space-y-1">
+        <Slider
+          label={`To ${fmt(end)}`}
+          value={end}
+          max={length}
+          step={1}
+          onChange={(v) => set(start, Math.max(v, start + 5))}
+        />
+        {lineAt(end - 1) && (
+          <p className="pl-[5rem] text-xs text-white/45">“{lineAt(end - 1)}”</p>
+        )}
+      </div>
+      <div className="flex items-center justify-between text-xs text-white/50">
+        <span>You&apos;ll sing {fmt(end - start)}</span>
+        {part && (
+          <button
+            onClick={() => onChange(null)}
+            className="rounded-full bg-white/10 px-3 py-1.5 text-white"
+          >
+            Whole song
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Toggle({
   label,
   hint,
@@ -992,20 +1145,24 @@ function Slider({
   value,
   onChange,
   max = 1,
+  step = 0.05,
 }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
   max?: number;
+  step?: number;
 }) {
   return (
     <label className="flex items-center gap-3 text-sm">
-      <span className="w-16 shrink-0 text-white/80">{label}</span>
+      <span className="w-[4.25rem] shrink-0 text-white/80 tabular-nums">
+        {label}
+      </span>
       <input
         type="range"
         min={0}
         max={max}
-        step={0.05}
+        step={step}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
         className="flex-1 accent-pink-500"
