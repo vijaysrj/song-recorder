@@ -8,6 +8,14 @@ Phone-first web app for singing Tamil and Hindi songs karaoke-style and recordin
 - Tick "already a karaoke track" to skip vocal removal.
 - Your track list is kept on the phone (browser storage).
 
+## Step 2: record yourself singing
+- Paste static lyrics for each song (Tamil, Hindi or English letters).
+- Tap Sing: front camera preview, lyrics over the video, 3-2-1 countdown.
+- Music plays in your headphones and is mixed cleanly with your voice in the recording
+  (music is delayed by the measured audio latency so voice and music line up).
+- Music and voice volume sliders, a limiter to prevent distortion, and auto-stop at the end of the song.
+- Records MP4 where the browser supports it (iPhone, recent Chrome), otherwise WebM.
+
 ## Setup
 Environment variables:
 - `BLOB_READ_WRITE_TOKEN`: added automatically when a Vercel Blob store is connected to the project.

@@ -21,7 +21,7 @@ export async function getDemucsVersion(replicate: Replicate) {
   return id;
 }
 
-// Demucs returns one URL per stem. With stem="vocals" we expect
+// Demucs returns one URL per stem. With isolate_stem="vocals" we expect
 // { vocals, no_vocals }; "no_vocals" is the karaoke track.
 export function pickInstrumental(output: unknown): string | undefined {
   if (!output || typeof output !== "object") return undefined;
