@@ -186,7 +186,8 @@ export default function Recorder({
             aspectRatio: { ideal: 9 / 16 },
           },
           { width: { ideal: 1920 }, height: { ideal: 1080 } },
-          { aspectRatio: { exact: 9 / 16 } },
+          { width: { ideal: 1280 }, height: { ideal: 720 } },
+          {},
         ]
       : [{ width: { ideal: 1920 }, height: { ideal: 1080 } }];
     const open = (v: MediaTrackConstraints) =>
@@ -194,17 +195,30 @@ export default function Recorder({
         video: { facingMode: "user", frameRate: { ideal: 30 }, ...v },
         audio,
       });
-    const isTall = (st: MediaStream) => {
-      const set = st.getVideoTracks()[0]?.getSettings();
-      return !!set?.width && !!set?.height && set.height > set.width;
-    };
+    // Measure the real picture: iPhone Safari's track settings report the
+    // sensor's sideways size even when the picture itself is upright.
+    const isTall = (st: MediaStream) =>
+      new Promise<boolean>((resolve) => {
+        const v = document.createElement("video");
+        v.muted = true;
+        v.playsInline = true;
+        const done = (ok: boolean) => {
+          clearTimeout(timer);
+          v.srcObject = null;
+          resolve(ok);
+        };
+        const timer = setTimeout(() => done(false), 3000);
+        v.onloadedmetadata = () => done(v.videoHeight > v.videoWidth);
+        v.srcObject = st;
+        v.play().catch(() => {});
+      });
     (async () => {
       let stream: MediaStream | null = null;
       let firstError: unknown;
       for (const v of tries) {
         try {
           const st = await open(v);
-          if (!portrait || isTall(st)) {
+          if (!portrait || (await isTall(st))) {
             stream = st;
             break;
           }
@@ -215,7 +229,7 @@ export default function Recorder({
       }
       // Nothing tall: take the camera's default; the picture is then trimmed
       // to a tall shape, as a phone camera does in portrait.
-      stream ??= await open(tries[0]).catch((e) => {
+      stream ??= await open(tries[1] ?? tries[0]).catch((e) => {
         throw firstError ?? e;
       });
       return stream;
