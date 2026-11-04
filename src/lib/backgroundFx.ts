@@ -82,6 +82,11 @@ export class BackgroundFx {
   /** Size of the recorded picture: the camera's own shape, Full HD. */
   ow = 1080;
   oh = 1920;
+  /** On a phone held upright: a wide camera picture is trimmed to 9:16. */
+  preferPortrait = false;
+  /** What the camera delivers, e.g. "1080×1920", for troubleshooting. */
+  cameraSize = "";
+  private crop = { x: 0, y: 0, w: 1, h: 1 };
   /** Told when the picture's shape is known or changes. */
   onSize?: (w: number, h: number) => void;
 
@@ -150,10 +155,24 @@ export class BackgroundFx {
   // Match the picture to the camera's shape (tall on a phone held upright,
   // wide on a laptop), scaled so the long side is Full HD.
   private fitTo(W: number, H: number) {
-    const k = OUT_LONG / Math.max(W, H);
-    const ow = Math.round((W * k) / 2) * 2;
-    const oh = Math.round((H * k) / 2) * 2;
-    if (ow === this.ow && oh === this.oh && this.out?.width === ow) return;
+    // The part of the camera picture to use: all of it, unless a phone held
+    // upright still sends a wide picture; then the middle, tall part.
+    let cw = W;
+    const ch = H;
+    if (this.preferPortrait && W > H) cw = Math.round((H * 9) / 16);
+    this.crop = { x: (W - cw) / 2, y: (H - ch) / 2, w: cw, h: ch };
+    const k = OUT_LONG / Math.max(cw, ch);
+    const ow = Math.round((cw * k) / 2) * 2;
+    const oh = Math.round((ch * k) / 2) * 2;
+    const size = `${W}×${H}`;
+    if (
+      ow === this.ow &&
+      oh === this.oh &&
+      this.out?.width === ow &&
+      size === this.cameraSize
+    )
+      return;
+    this.cameraSize = size;
     this.ow = ow;
     this.oh = oh;
     this.segH = Math.round((SEG_W * oh) / ow);
@@ -242,7 +261,8 @@ export class BackgroundFx {
     const fg = ctx2d(this.frame);
     fg.imageSmoothingEnabled = true;
     fg.imageSmoothingQuality = "high";
-    fg.drawImage(v, 0, 0, this.ow, this.oh);
+    const c = this.crop;
+    fg.drawImage(v, c.x, c.y, c.w, c.h, 0, 0, this.ow, this.oh);
 
     const og = ctx2d(out);
     const effectOn =

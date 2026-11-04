@@ -101,6 +101,7 @@ export default function Recorder({
   const [rawCamera, setRawCamera] = useState(false);
   // Shape of the picture (width / height), from the camera.
   const [aspect, setAspect] = useState(9 / 16);
+  const [camSize, setCamSize] = useState("");
   const [sheet, setSheet] = useState<null | "bg" | "sound">(null);
   const [thumbs] = useState(() =>
     Object.fromEntries(
@@ -115,7 +116,10 @@ export default function Recorder({
 
   useEffect(() => {
     fx.onStatus = setFxStatus;
-    fx.onSize = (w, h) => setAspect(w / h);
+    fx.onSize = (w, h) => {
+      setAspect(w / h);
+      setCamSize(fx.cameraSize);
+    };
     return () => {
       fx.onStatus = undefined;
       fx.onSize = undefined;
@@ -155,30 +159,67 @@ export default function Recorder({
     hp = headphones,
   ) {
     const portrait = window.matchMedia("(orientation: portrait)").matches;
-    navigator.mediaDevices
-      .getUserMedia({
-        // Full HD, shaped like the screen: tall on a phone, wide on a laptop.
-        video: {
-          facingMode: "user",
-          width: { ideal: portrait ? 1080 : 1920 },
-          height: { ideal: portrait ? 1920 : 1080 },
-          frameRate: { ideal: 30 },
-        },
-        // With headphones: raw, full-band voice. There is no echo to cancel,
-        // and phone call filters make singing sound thin and pumpy; the
-        // studio chain does the polishing instead.
-        // Without headphones: the phone's echo cancelling removes the music
-        // coming out of the speaker, so the video doesn't get it twice.
-        audio: {
-          ...(mic ? { deviceId: { exact: mic } } : {}),
-          echoCancellation: !hp,
-          noiseSuppression: !hp,
-          autoGainControl: false,
-          sampleRate: { ideal: 48000 },
-          sampleSize: { ideal: 24 },
-          channelCount: { ideal: 1 },
-        },
-      })
+    fx.preferPortrait = portrait;
+    // With headphones: raw, full-band voice. There is no echo to cancel,
+    // and phone call filters make singing sound thin and pumpy; the studio
+    // chain does the polishing instead.
+    // Without headphones: the phone's echo cancelling removes the music
+    // coming out of the speaker, so the video doesn't get it twice.
+    const audio: MediaTrackConstraints = {
+      ...(mic ? { deviceId: { exact: mic } } : {}),
+      echoCancellation: !hp,
+      noiseSuppression: !hp,
+      autoGainControl: false,
+      sampleRate: { ideal: 48000 },
+      sampleSize: { ideal: 24 },
+      channelCount: { ideal: 1 },
+    };
+    // Browsers differ in how they read width/height on a phone held
+    // upright (some mean the sensor's sideways shape), and some hand back a
+    // wide picture. Try the ways of asking in turn and keep the first that
+    // gives a tall, full picture, like the phone's own camera.
+    const tries: MediaTrackConstraints[] = portrait
+      ? [
+          {
+            width: { ideal: 1080 },
+            height: { ideal: 1920 },
+            aspectRatio: { ideal: 9 / 16 },
+          },
+          { width: { ideal: 1920 }, height: { ideal: 1080 } },
+          { aspectRatio: { exact: 9 / 16 } },
+        ]
+      : [{ width: { ideal: 1920 }, height: { ideal: 1080 } }];
+    const open = (v: MediaTrackConstraints) =>
+      navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", frameRate: { ideal: 30 }, ...v },
+        audio,
+      });
+    const isTall = (st: MediaStream) => {
+      const set = st.getVideoTracks()[0]?.getSettings();
+      return !!set?.width && !!set?.height && set.height > set.width;
+    };
+    (async () => {
+      let stream: MediaStream | null = null;
+      let firstError: unknown;
+      for (const v of tries) {
+        try {
+          const st = await open(v);
+          if (!portrait || isTall(st)) {
+            stream = st;
+            break;
+          }
+          st.getTracks().forEach((t) => t.stop());
+        } catch (e) {
+          firstError ??= e;
+        }
+      }
+      // Nothing tall: take the camera's default; the picture is then trimmed
+      // to a tall shape, as a phone camera does in portrait.
+      stream ??= await open(tries[0]).catch((e) => {
+        throw firstError ?? e;
+      });
+      return stream;
+    })()
       .then((stream) => {
         if (isCancelled()) return stream.getTracks().forEach((t) => t.stop());
         camRef.current = stream;
@@ -805,6 +846,11 @@ export default function Recorder({
                   {headphones
                     ? "Wired headphones sound best. Bluetooth ones switch the phone to a low-quality call mic."
                     : "Keep the music moderate and the phone 20–30 cm away."}
+                  {camSize && (
+                    <span className="mt-1 block text-white/30">
+                      Camera {camSize}
+                    </span>
+                  )}
                 </p>
               </div>
             )}
