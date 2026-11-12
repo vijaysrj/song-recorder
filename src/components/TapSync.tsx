@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import type { Song, TimedLine } from "@/lib/library";
 import { fmtTime } from "@/lib/lrc";
+import { useTrack } from "@/lib/tracks";
 
 // Play the song once and tap as each line starts; the times are saved.
 export default function TapSync({
@@ -14,6 +15,7 @@ export default function TapSync({
   onSave: (timed: TimedLine[]) => void;
   onClose: () => void;
 }) {
+  const track = useTrack(song);
   const lines = song.lyrics
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -53,7 +55,7 @@ export default function TapSync({
 
       <audio
         ref={audioRef}
-        src={song.trackUrl}
+        src={track?.url || undefined}
         controls
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}

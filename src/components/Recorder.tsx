@@ -5,6 +5,7 @@ import type { Song } from "@/lib/library";
 import TimedLyrics from "./TimedLyrics";
 import VideoEditor from "./VideoEditor";
 import { currentLine } from "@/lib/lrc";
+import { useTrack } from "@/lib/tracks";
 import { buildVocalChain } from "@/lib/vocalChain";
 import { BackgroundFx, type FxStatus } from "@/lib/backgroundFx";
 import { toShareableMp4 } from "@/lib/finalizeVideo";
@@ -64,6 +65,7 @@ export default function Recorder({
   song: Song;
   onClose: () => void;
 }) {
+  const trackUrl = useTrack(song)?.url ?? "";
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const camRef = useRef<MediaStream | null>(null);
@@ -113,11 +115,12 @@ export default function Recorder({
     a.preload = "metadata";
     a.onloadedmetadata = () =>
       Number.isFinite(a.duration) && setSongLength(a.duration);
-    a.src = song.trackUrl;
+    if (!trackUrl) return;
+    a.src = trackUrl;
     return () => {
       a.removeAttribute("src");
     };
-  }, [song.trackUrl]);
+  }, [trackUrl]);
   const partStart = part?.start ?? 0;
   // Video editing: the editor is open, and the unedited recording (so an
   // edit can always be redone from the original).
@@ -320,7 +323,8 @@ export default function Recorder({
       ctxRef.current = ctx;
       await ctx.resume();
 
-      const res = await fetch(song.trackUrl);
+      if (!trackUrl) throw new Error("The karaoke track is not on this device");
+      const res = await fetch(trackUrl);
       if (!res.ok) throw new Error("Could not load the karaoke track");
       const buffer = await ctx.decodeAudioData(await res.arrayBuffer());
       const from = Math.min(part?.start ?? 0, buffer.duration - 1);

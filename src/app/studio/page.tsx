@@ -6,6 +6,7 @@ import AddSong from "@/components/AddSong";
 import Recorder from "@/components/Recorder";
 import SongList from "@/components/SongList";
 import { songStore, type Song } from "@/lib/library";
+import { deleteTrack } from "@/lib/tracks";
 
 export default function Studio() {
   const songs = useSyncExternalStore(
@@ -33,7 +34,10 @@ export default function Studio() {
       <p className="mb-5 text-sm text-white/55">Pick a song and tap Sing.</p>
       <SongList
         songs={songs}
-        onDelete={(id) => update(songs.filter((s) => s.id !== id))}
+        onDelete={(id) => {
+          update(songs.filter((s) => s.id !== id));
+          deleteTrack(id);
+        }}
         onUpdate={(song) =>
           update(songs.map((s) => (s.id === song.id ? song : s)))
         }

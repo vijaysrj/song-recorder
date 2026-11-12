@@ -1,12 +1,15 @@
 "use client";
 
-import { upload } from "@vercel/blob/client";
 import { useState } from "react";
 import type { Song } from "@/lib/library";
+import { shrinkForUpload } from "@/lib/shrinkAudio";
+import { saveTrack } from "@/lib/tracks";
 
 type Phase =
   | { kind: "idle" }
-  | { kind: "uploading"; pct: number }
+  | { kind: "preparing"; pct: number }
+  | { kind: "uploading" }
+  | { kind: "saving" }
   | { kind: "separating"; seconds: number }
   | { kind: "error"; message: string };
 
@@ -51,30 +54,33 @@ export default function AddSong({
   const [title, setTitle] = useState("");
   const [isKaraoke, setIsKaraoke] = useState(false);
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
-  const busy = phase.kind === "uploading" || phase.kind === "separating";
+  const busy = phase.kind !== "idle" && phase.kind !== "error";
 
   async function start() {
     if (!file) return;
     try {
-      setPhase({ kind: "uploading", pct: 0 });
-      const blob = await upload(`songs/${file.name}`, file, {
-        access: "public",
-        contentType: contentTypeFor(file),
-        handleUploadUrl: "/api/upload",
-        onUploadProgress: (e) =>
-          setPhase({ kind: "uploading", pct: Math.round(e.percentage) }),
-      });
-
-      let trackUrl = blob.url;
+      const id = crypto.randomUUID();
+      const type = contentTypeFor(file);
+      let track: Blob = new Blob([file], { type });
       if (!isKaraoke) {
+        setPhase({ kind: "preparing", pct: 0 });
+        const small = await shrinkForUpload(file, type, (p) =>
+          setPhase({ kind: "preparing", pct: Math.round(p * 100) }),
+        );
+        setPhase({ kind: "uploading" });
         const res = await fetch("/api/separate", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: blob.url }),
+          headers: { "Content-Type": small.type || type },
+          body: small,
         });
-        const job = await res.json();
+        const job = await res.json().catch(() => ({}));
         if (!res.ok)
-          throw new Error(job.error ?? "Could not start vocal removal");
+          throw new Error(
+            job.error ??
+              (res.status === 413
+                ? "The song file is too big"
+                : "Could not start vocal removal"),
+          );
 
         const startedAt = Date.now();
         for (;;) {
@@ -84,19 +90,21 @@ export default function AddSong({
           });
           await sleep(4000);
           const s = await (await fetch(`/api/separate/${job.id}`)).json();
-          if (s.status === "done") {
-            trackUrl = s.url;
-            break;
-          }
+          if (s.status === "done") break;
           if (s.status === "failed")
             throw new Error(s.error ?? "Vocal removal failed");
         }
+        setPhase({ kind: "saving" });
+        const out = await fetch(`/api/separate/${job.id}/track`);
+        if (!out.ok) throw new Error("Could not download the karaoke track");
+        track = new Blob([await out.blob()], { type: "audio/mpeg" });
       }
+      await saveTrack(id, track);
 
       onAdded({
-        id: crypto.randomUUID(),
+        id,
         title: title.trim() || file.name.replace(/\.[^.]+$/, ""),
-        trackUrl,
+        trackUrl: "",
         lyrics: "",
         createdAt: Date.now(),
       });
@@ -183,8 +191,18 @@ export default function AddSong({
         {isKaraoke ? "Add song" : "Remove vocals and add"}
       </button>
 
+      {phase.kind === "preparing" && (
+        <p className="mt-3 text-sm text-white/70">
+          Preparing the song… {phase.pct}%
+        </p>
+      )}
       {phase.kind === "uploading" && (
-        <p className="mt-3 text-sm text-white/70">Uploading… {phase.pct}%</p>
+        <p className="mt-3 text-sm text-white/70">Sending the song…</p>
+      )}
+      {phase.kind === "saving" && (
+        <p className="mt-3 text-sm text-white/70">
+          Saving the karaoke track on this phone…
+        </p>
       )}
       {phase.kind === "separating" && (
         <p className="mt-3 text-sm text-white/70">

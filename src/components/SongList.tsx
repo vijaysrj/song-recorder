@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { Song } from "@/lib/library";
 import LyricsFinder from "./LyricsFinder";
 import TapSync from "./TapSync";
+import { extFor, useTrack } from "@/lib/tracks";
 
 // One card per song: a big Sing button, with everything else tucked under
 // "More" so the list stays calm.
@@ -68,12 +69,7 @@ export default function SongList({
 
             {isOpen && (
               <div className="space-y-3 border-t border-white/10 p-4">
-                <audio
-                  controls
-                  preload="none"
-                  src={s.trackUrl}
-                  className="h-10 w-full"
-                />
+                <TrackPlayer song={s} />
 
                 <div className="grid grid-cols-2 gap-2">
                   <SmallButton
@@ -96,12 +92,7 @@ export default function SongList({
                   >
                     Tap to time lines
                   </SmallButton>
-                  <a
-                    href={`${s.trackUrl}${s.trackUrl.includes("?") ? "&" : "?"}download=1`}
-                    className="rounded-xl bg-white/[0.07] py-2.5 text-center text-sm font-medium hover:bg-white/10"
-                  >
-                    Download track
-                  </a>
+                  <DownloadTrack song={s} />
                 </div>
 
                 {editing === s.id ? (
@@ -179,5 +170,45 @@ function SmallButton({
     >
       {children}
     </button>
+  );
+}
+
+function TrackPlayer({ song }: { song: Song }) {
+  const track = useTrack(song);
+  if (track && !track.url)
+    return (
+      <p className="text-sm text-red-300">
+        The karaoke track is missing on this device. Remove the song and add it
+        again.
+      </p>
+    );
+  return (
+    <audio
+      controls
+      preload="metadata"
+      src={track?.url || undefined}
+      className="h-10 w-full"
+    />
+  );
+}
+
+function DownloadTrack({ song }: { song: Song }) {
+  const track = useTrack(song);
+  const cls =
+    "rounded-xl bg-white/[0.07] py-2.5 text-center text-sm font-medium hover:bg-white/10";
+  if (!track?.url) return <span className={cls + " opacity-40"}>Download track</span>;
+  const local = track.url.startsWith("blob:");
+  return (
+    <a
+      href={
+        local
+          ? track.url
+          : `${track.url}${track.url.includes("?") ? "&" : "?"}download=1`
+      }
+      download={local ? `${song.title} (karaoke).${extFor(track.type)}` : undefined}
+      className={cls}
+    >
+      Download track
+    </a>
   );
 }
